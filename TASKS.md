@@ -65,6 +65,25 @@ A block is **only** checked off when its DV passes (`make -C hw/ip/<block>/dv te
 
 Task IDs above match TaskList IDs for this session. Status there is authoritative for in-flight work; this file is the durable plan.
 
+## Generator / scaling path
+
+Non-destructive generator work lives under `tools/layergen/` and emits artifacts
+under `integ/generated/` so the hand-built `integ/layer_*` reference code is not
+overwritten.
+
+- [x] Create `tools/layergen/layergen.py` with balanced scale package generation.
+- [x] Emit `integ/generated/scale/scale_pkg_balanced.sv` and report with generated `P_PIX` wrapper support: area proxy 22,096, worst real-chip layer 80,000 cycles, 0 target misses at `T_FRAME=100000`.
+- [x] Emit generated L0 and L21 skeletons at `integ/generated/layer_0_model0/` and `integ/generated/layer_21_model7/`.
+- [x] Lint generated L0 and L21 skeletons with `make -C integ/generated/layer_<N>/dv lint`.
+- [x] Verify target-cycle control with generated reports for 120k/100k/80k/64k. Results are discrete because legal factors are divisors; 100k and 80k currently choose the same factors for most layers.
+- [x] Fix grouped/depthwise conv MAC accounting in `tools/layergen` (`Cin/group`).
+- [x] Add generated `P_PIX>1` wrapper support by instantiating multiple lockstep `conv_layer` lanes.
+- [x] Generate ORT `extract.py` automatically for ordinary non-residual Conv+SiLU layers, piloted on L21.
+- [x] Generate a generic tiled C++ sample driver automatically, piloted on L21 with `P_PIX=2`.
+- [x] Promote generated L21 from lint-clean skeleton to ORT-validated layer: `make -C integ/generated/layer_21_model7/dv test` passes 6/6, avg cos 0.999290.
+- [x] Generalize generated Conv+SiLU DV across L22-L25 and batch-run the next wave.
+- [x] Fix generated extractor branch target selection for parallel cv1/cv2 branches; L24 originally targeted L23's activation until the extractor matched the current conv prefix.
+
 ## YOLO26n layer build progress (target T=100,000 cyc/frame)
 
 Per-layer DV against ORT subgraph slice. Each layer composes the
@@ -72,30 +91,30 @@ verified `hw/ip/*` blocks under `scale_pkg::LAYER_<i>_*` parameters.
 
 - [x] L0   /model.0    /model.0                                                conv 3->16, s2, k3, 320² → cosine 0.9988, 73 cyc
 - [x] L1   /model.1    /model.1                                                conv 16->32, s2, k3, 160² → cosine 0.9987, 76 cyc
-- [ ] L2   /model.2    /model.2/cv1                                            conv 32->32, s1, k1, 160²
-- [ ] L3   /model.2    /model.2/m.0/cv1                                        conv 16->8, s1, k3, 160²
-- [ ] L4   /model.2    /model.2/m.0/cv2                                        conv 8->16, s1, k3, 160²
-- [ ] L5   /model.2    /model.2/cv2                                            conv 48->64, s1, k1, 160²
-- [ ] L6   /model.3    /model.3                                                conv 64->64, s2, k3, 80²
-- [ ] L7   /model.4    /model.4/cv1                                            conv 64->64, s1, k1, 80²
-- [ ] L8   /model.4    /model.4/m.0/cv1                                        conv 32->16, s1, k3, 80²
-- [ ] L9   /model.4    /model.4/m.0/cv2                                        conv 16->32, s1, k3, 80²
-- [ ] L10  /model.4    /model.4/cv2                                            conv 96->128, s1, k1, 80²
-- [ ] L11  /model.5    /model.5                                                conv 128->128, s2, k3, 40²
-- [ ] L12  /model.6    /model.6/cv1                                            conv 128->128, s1, k1, 40²
-- [ ] L13  /model.6    /model.6/m.0/cv1                                        conv 64->32, s1, k1, 40²
-- [ ] L14  /model.6    /model.6/m.0/cv2                                        conv 64->32, s1, k1, 40²
-- [ ] L15  /model.6    /model.6/m.0/m/m.0/cv1                                  conv 32->32, s1, k3, 40²
-- [ ] L16  /model.6    /model.6/m.0/m/m.0/cv2                                  conv 32->32, s1, k3, 40²
-- [ ] L17  /model.6    /model.6/m.0/m/m.1/cv1                                  conv 32->32, s1, k3, 40²
-- [ ] L18  /model.6    /model.6/m.0/m/m.1/cv2                                  conv 32->32, s1, k3, 40²
-- [ ] L19  /model.6    /model.6/m.0/cv3                                        conv 64->64, s1, k1, 40²
-- [ ] L20  /model.6    /model.6/cv2                                            conv 192->128, s1, k1, 40²
-- [ ] L21  /model.7    /model.7                                                conv 128->256, s2, k3, 20²
-- [ ] L22  /model.8    /model.8/cv1                                            conv 256->256, s1, k1, 20²
-- [ ] L23  /model.8    /model.8/m.0/cv1                                        conv 128->64, s1, k1, 20²
-- [ ] L24  /model.8    /model.8/m.0/cv2                                        conv 128->64, s1, k1, 20²
-- [ ] L25  /model.8    /model.8/m.0/m/m.0/cv1                                  conv 64->64, s1, k3, 20²
+- [x] L2   /model.2    /model.2/cv1                                            conv 32->32, s1, k1, 160²
+- [x] L3   /model.2    /model.2/m.0/cv1                                        conv 16->8, s1, k3, 160²
+- [x] L4   /model.2    /model.2/m.0/cv2                                        conv 8->16, s1, k3, 160²
+- [x] L5   /model.2    /model.2/cv2                                            conv 48->64, s1, k1, 160²
+- [x] L6   /model.3    /model.3                                                conv 64->64, s2, k3, 80²
+- [x] L7   /model.4    /model.4/cv1                                            conv 64->64, s1, k1, 80²
+- [x] L8   /model.4    /model.4/m.0/cv1                                        conv 32->16, s1, k3, 80²
+- [x] L9   /model.4    /model.4/m.0/cv2                                        conv 16->32, s1, k3, 80²
+- [x] L10  /model.4    /model.4/cv2                                            conv 96->128, s1, k1, 80²
+- [x] L11  /model.5    /model.5                                                conv 128->128, s2, k3, 40²
+- [x] L12  /model.6    /model.6/cv1                                            conv 128->128, s1, k1, 40²
+- [x] L13  /model.6    /model.6/m.0/cv1                                        conv 64->32, s1, k1, 40²
+- [x] L14  /model.6    /model.6/m.0/cv2                                        conv 64->32, s1, k1, 40²
+- [x] L15  /model.6    /model.6/m.0/m/m.0/cv1                                  conv 32->32, s1, k3, 40²
+- [x] L16  /model.6    /model.6/m.0/m/m.0/cv2                                  conv 32->32, s1, k3, 40²
+- [x] L17  /model.6    /model.6/m.0/m/m.1/cv1                                  conv 32->32, s1, k3, 40²
+- [x] L18  /model.6    /model.6/m.0/m/m.1/cv2                                  conv 32->32, s1, k3, 40²
+- [x] L19  /model.6    /model.6/m.0/cv3                                        conv 64->64, s1, k1, 40²
+- [x] L20  /model.6    /model.6/cv2                                            conv 192->128, s1, k1, 40² → cosine 0.9998, 8/8 samples
+- [x] L21  /model.7    /model.7                                                conv 128->256, s2, k3, 20² → generated DV cosine 0.9993, 6/6 samples
+- [x] L22  /model.8    /model.8/cv1                                            conv 256->256, s1, k1, 20² → generated DV cosine 0.9991, 6/6 samples
+- [x] L23  /model.8    /model.8/m.0/cv1                                        conv 128->64, s1, k1, 20² → generated DV cosine 0.9977, 6/6 samples
+- [x] L24  /model.8    /model.8/m.0/cv2                                        conv 128->64, s1, k1, 20² → generated DV cosine 0.9996, 6/6 samples
+- [x] L25  /model.8    /model.8/m.0/m/m.0/cv1                                  conv 64->64, s1, k3, 20² → generated DV cosine 0.9984, 6/6 samples
 - [ ] L26  /model.8    /model.8/m.0/m/m.0/cv2                                  conv 64->64, s1, k3, 20²
 - [ ] L27  /model.8    /model.8/m.0/m/m.1/cv1                                  conv 64->64, s1, k3, 20²
 - [ ] L28  /model.8    /model.8/m.0/m/m.1/cv2                                  conv 64->64, s1, k3, 20²

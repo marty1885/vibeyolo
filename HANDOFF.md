@@ -30,9 +30,11 @@ The user assumes "magical SRAM": activations stream in/out from external SRAM th
 │   │   ├── scale_pkg.sv         REAL-CHIP config (P_COUT/P_CIN for synthesis)
 │   │   ├── scale_pkg_dv.sv      DV-CAPPED config (P_COUT≤16, P_CIN≤8 for fast verilator)
 │   │   └── scale_report.md
+│   ├── generated/               non-destructive generated scale/layer experiments
 │   ├── _layer_template/         canonical tiled layer reference + README
-│   ├── stem_l0/  layer_1..19_*  per-layer dirs: extract.py + rtl/ + dv/ + README
+│   ├── stem_l0/  layer_1..20_*  per-layer dirs: extract.py + rtl/ + dv/ + README
 │   └── ...
+├── tools/layergen/              new generator for balanced scale + layer skeletons
 ├── mk/verilator.mk              shared make recipe
 ├── dv/common/                   shared SimCtrl<T> C++ harness
 └── TASKS.md                     long-running task log
@@ -46,11 +48,32 @@ The user assumes "magical SRAM": activations stream in/out from external SRAM th
 - DV runs ≥30k random vectors clean on the leaf IPs.
 
 ### Layers built and ORT-validated
-**20 of 102 conv layers** done:
+**26 of 102 conv layers** done:
 - L0 (stem), L1 (4/6 — known stim issue), L2, L3, L4 (+resid), L5, L6 (3×3 s2), L7, L8, L9 (+resid), L10, L11, L12, L13
 - L14, L15, L16 (+resid), L17, L18 (+resid), L19 — model.6 C3k2 nested bottlenecks
+- L20 (`/model.6/cv2`) — non-residual exit conv, 192→128 k1 s1 at 40×40. `make -C integ/layer_20_cv2/dv test` passes 8/8 samples, avg cos 0.999791.
+- L21-L25 are generated under `integ/generated/` and ORT-validated by generated DV.
 
 Each layer = `extract.py` (ORT-driven stim/golden) + ~30-80 line `.sv` shim around `conv_layer` + TB + Makefile. Cosine ≥ 0.998 vs ORT on ≥3 random tiles.
+
+### Generator path started
+- `tools/layergen/layergen.py` is a **non-destructive** generator. It writes under `integ/generated/` by default, so it does not overwrite hand-built `integ/layer_*`.
+- It can emit balanced scale packages:
+  - `integ/generated/scale/scale_pkg_balanced.sv`
+  - `integ/generated/scale/scale_pkg_balanced_dv.sv`
+  - markdown reports next to them
+- Balancing rule: minimize area proxy `P_PIX * P_COUT * P_CIN` subject to `cycles <= T_FRAME`. Grouped/depthwise convs count only `Cin/group` input channels. Ties prefer stage cycles closer to target.
+- Current default is `max_p_pix=2`. The `conv_layer` leaf is still single-pixel; generated wrappers implement `P_PIX>1` by instantiating multiple `conv_layer` lanes.
+- Current balanced real-chip report at `T_FRAME=100000`: total area proxy 22,096, worst layer 80,000 cycles, 0 target misses.
+- Generated L0 and L21 skeletons exist at `integ/generated/layer_0_model0/` and `integ/generated/layer_21_model7/`; both lint clean.
+- Generated L21 is now ORT-validated with generated `extract.py` + generated C++ tiled driver: `make -C integ/generated/layer_21_model7/dv test` passes 6/6 samples, avg cos 0.999290, with `P_PIX=2 P_COUT=16 P_CIN=8`.
+- Generated L22-L25 also pass ORT-backed generated DV:
+  - L22 avg cos 0.999145, 6/6 samples
+  - L23 avg cos 0.997680, 6/6 samples
+  - L24 avg cos 0.999556, 6/6 samples
+  - L25 avg cos 0.998416, 6/6 samples
+- Generator extractor target selection was fixed to match the current conv prefix. This matters for parallel branches like `/model.8/m.0/cv1` and `/model.8/m.0/cv2`; otherwise a later layer could accidentally compare against a sibling activation.
+- Generator functional DV path currently covers ordinary `group=1` Conv+SiLU only. Residual, grouped/depthwise, concat/add, attention, and detect still need explicit support.
 
 ### Numbers
 - **Real chip**: worst-layer 76,800 cyc → 13K FPS @ 1 GHz. Median 51,200 cyc.
@@ -60,12 +83,13 @@ Each layer = `extract.py` (ORT-driven stim/golden) + ~30-80 line `.sv` shim arou
 ## What's next
 
 ### Immediate (conv layers, easy after the IP work)
-1. **L20–L101**: 82 more conv layers. Each is mostly mechanical with `conv_layer` shim pattern. Spawn agents in waves of 4-8.
-2. Layer naming heuristic: read `integ/scale/scale_pkg.sv` for the canonical L_N name → ONNX node mapping.
+1. **Continue generated Conv+SiLU**: next ordinary layers are L26-L30, but L26/L28 are residual-add convs in the nested bottleneck path, so generator residual support is now the next useful feature.
+2. Add generator support for residual/add paths, then validate L26-L30.
+3. Layer naming heuristic: read `integ/scale/scale_pkg.sv` for the canonical L_N name → ONNX node mapping.
 
 ### New IPs needed (not yet built)
-1. **`maxpool_5x5`** — for SPPF block (between L31 and L32). Stride-1, padding 2. Streaming K×K max — same linebuf shape, replace MAC tree with comparator tree.
-2. **`upsample_2x`** — neck nearest-neighbor 2× (between backbone and head). Trivial: register every input twice per dim.
+1. **SPPF maxpool integration** — `hw/ip/maxpool_kxk` already exists and DV covers K=5; still need a layer-level SPPF integration block between L31 and L32.
+2. **Upsample integration** — `hw/ip/upsample2` already exists and DV passes; still need neck wiring around the upsample/concat points.
 3. **Attention block** (`a2c2f` or `psa`) — deeper neck has attention. softmax16 already validated; need to compose Q/K/V projections + attention scores. Look at YOLO26n's PSA/A2C2f block structure in ONNX.
 4. **Detect head** — YOLO26 is **end-to-end (no NMS)**, uses learned top-k. `box_decode` already validated; need to wire it up + top-k logic.
 
@@ -102,6 +126,22 @@ Output: y_o[P_COUT][7:0]
 - `scale_pkg_dv.sv` — DV ONLY. P_COUT ≤ 16, P_CIN ≤ 8 by default. Same package name (`scale_pkg`), so RTL is unchanged — verilator picks whichever file is on the command line. **Per-layer Makefiles point at scale_pkg_dv.sv.**
 
 Regenerate either with `python3 integ/scale/gen_scale_pkg.py [--dv]`. The new math credits the K×K fold inside dotN, so cycles = M / (P_PIX·P_COUT·K²·P_CIN).
+
+### Balanced generated scale path
+
+Use this for new experiments without touching the checked hand-built scale files:
+
+```bash
+python3 tools/layergen/layergen.py --emit-scale --emit-dv-scale --gen-layer 0 --gen-layer 21
+make -C integ/generated/layer_0_model0/dv lint
+make -C integ/generated/layer_21_model7/dv lint
+```
+
+Important:
+- `scale_pkg_balanced*.sv` still declare package name `scale_pkg`, so include only one scale package per Verilator/synthesis command.
+- Generated DV scale is intentionally capped (`P_COUT<=16`, `P_CIN<=8`) and can miss `T_FRAME`; it is for build speed, not real timing.
+- Generated layer skeletons are not complete layer validations until `extract.py` and the C++ sample driver exist.
+- Generated wrappers implement `P_PIX>1` as parallel `conv_layer` lanes sharing weights/scales. This increases area roughly linearly with `P_PIX` for that layer.
 
 ### How to add a new conv layer
 
@@ -175,6 +215,11 @@ VERILATOR_JOBS=4 make -C integ/layer_N/dv test
 python3 integ/scale/gen_scale_pkg.py --T 100000
 python3 integ/scale/gen_scale_pkg.py --T 100000 --dv --dv-cout-cap 16 --dv-cin-cap 8
 
+# Generate balanced experimental scale + L0/L21 skeletons
+python3 tools/layergen/layergen.py --emit-scale --emit-dv-scale --gen-layer 0 --gen-layer 21
+make -C integ/generated/layer_0_model0/dv lint
+make -C integ/generated/layer_21_model7/dv lint
+
 # Inspect ONNX
 python3 -c "
 import onnx, onnx.shape_inference as si
@@ -187,18 +232,19 @@ for n in m.graph.node:
 ## Where to look first
 
 1. `integ/layer_11/` — canonical working layer using conv_layer shim.
-2. `hw/ip/conv_layer/README.md` — IP doc with parameter list and dataflow.
-3. `integ/_layer_template/README.md` — original tiled template + retrofit recipe.
-4. `integ/scale/scale_pkg.sv` (or `_dv.sv`) — per-layer P_COUT/P_CIN/CIN/COUT/K/etc constants.
-5. `TASKS.md` — log of completed work.
+2. `integ/layer_20_cv2/` — newest completed generated-pattern hand layer, useful for automating L21+.
+3. `tools/layergen/` — non-destructive balanced scale/layer skeleton generator.
+4. `hw/ip/conv_layer/README.md` — IP doc with parameter list and dataflow.
+5. `integ/_layer_template/README.md` — original tiled template + retrofit recipe.
+6. `integ/scale/scale_pkg.sv` (or `_dv.sv`) — per-layer P_COUT/P_CIN/CIN/COUT/K/etc constants.
+7. `TASKS.md` — log of completed work.
 
 ## What I'd do next (concrete plan for the new AI)
 
-1. **Wave 6**: Build L20–L25 using `conv_layer` shim. Reference integ/layer_11/. Spawn one agent for the whole wave; ~10 min wall-clock.
-2. **Wave 7-22**: Continue L26–L101 in similar waves of 4-6 layers.
-3. **Build `maxpool_5x5` IP** when reaching SPPF layers (L32-ish region).
-4. **Build `upsample_2x` IP** when reaching neck (~L40+ region).
-5. **Build attention block IPs** for A2C2f/PSA in deeper neck.
-6. **Top-level integration** + E2E ORT validation on real images.
+1. Add residual/add support to `tools/layergen`, using L26 (`/model.8/m.0/m/m.0/cv2`) as the pilot.
+2. Generate/validate L26-L30. L26 and L28 need residual/add handling; L27/L29/L30 should be ordinary Conv+SiLU once their inputs are identified.
+3. Continue conv layers in generated waves, but stop at graph-boundary ops to add explicit support for concat, SPPF maxpool integration, upsample integration, attention, and detect head.
+4. Build attention block IPs for A2C2f/PSA in deeper neck.
+5. Top-level integration + E2E ORT validation on real images.
 
 The hardest remaining technical risk is the **detect head** (end-to-end, learned top-k, no NMS). Look at the ONNX for `/model.23` and below before designing it.
