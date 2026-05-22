@@ -21,6 +21,9 @@ venv/
 **/stim/*.f32
 **/stim/manifest.json
 **/stim/.stim.stamp
+# Auto-generated per-block scale packages (re-derivable from extract.py).
+**/stim/*_scales_pkg.sv
+**/stim/s_out_params.sv
 
 # Batch-run logs / scratch reports
 **/_batch_logs/
