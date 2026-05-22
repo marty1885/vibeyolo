@@ -20,6 +20,14 @@ venv/
 **/stim/*.i8
 **/stim/*.f32
 **/stim/manifest.json
+**/stim/.stim.stamp
+
+# Batch-run logs / scratch reports
+**/_batch_logs/
+**/_batch_*/
+
+# Scale experiments (re-derivable from layergen.py)
+integ/generated/scale_experiments/
 
 # Large intermediate ONNX files (re-derivable)
 **/_model_with_intermediate.onnx

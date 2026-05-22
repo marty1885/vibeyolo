@@ -205,6 +205,13 @@ verified `hw/ip/*` blocks under `scale_pkg::LAYER_<i>_*` parameters.
 - [x] L100 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.1 conv 80->80, s1, k1, 20²
 - [x] L101 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.2                 conv 80->80, s1, k1, 20²
 
+## Block-level integration
+
+- [x] **SPPF block** (`integ/sppf_model9/`) — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31 output, then `concat_mux` of {L31, mp1, mp2, mp3} feeding L32. 10/10 checks, 5/5 ORT samples bit-exact vs SW ref, cos ≥ 0.99994 vs ORT (H=20 W=20 C=128 K=5).
+- [ ] **Upsample integration** — two neck points: P4→P3 after L39, P3→detect after L48. `upsample2` + `concat_mux` with skip-FIFO.
+- [ ] **Attention block** (PSA / A2C2f) — QKV split + attention-matmul + softmax around already-validated proj/FFN convs.
+- [ ] **Detect head with learned top-k** — end-to-end, no NMS. Largest remaining technical risk.
+
 ## Chip top-level (frozen for PD)
 
 - [x] `hw/ip/yolo26n_top/` — frozen chip boundary for PD handoff.

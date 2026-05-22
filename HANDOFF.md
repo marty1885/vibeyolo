@@ -93,11 +93,15 @@ ls -d integ/generated/layer_*/dv | xargs -I{} -P 6 bash -c \
 
 All 102 conv layers are ORT-validated. The remaining work is block-level integration around graph boundaries (SPPF, upsamples, attention, detect head) and then top-level wiring.
 
-### Block-level IPs to build (in recommended order)
-1. **SPPF integration block** *(smallest, mechanical)* — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31's output, then `concat_mux` of {L31_out, mp1, mp2, mp3} feeding L32's input. Leaf IPs ready. Validate against ORT subgraph `/model.9/cv1 → maxpool×3 → concat → /model.9/cv2`.
-2. **Upsample integration** *(small, mechanical)* — two neck points: backbone P4→P3 (after L39) and P3→detect (after L48). Each: `upsample2` then `concat_mux` with the P3/P4 skip-FIFO output. Leaf IPs ready.
-3. **Attention block (PSA / A2C2f)** *(medium)* — composes already-validated convs (L34-L38 model.10, L88-L92 model.22) with `softmax16` + fp16_fma attention scores. New work is the QKV split + attention-matmul + residuals around the proj and FFN convs (proj/FFN convs themselves already pass standalone).
-4. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
+### Block-level IPs
+
+**Done:**
+- [x] **SPPF integration block** (`integ/sppf_model9/`) — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31's output, then `concat_mux` of {L31_out, mp1, mp2, mp3} feeding L32's input. 10/10 checks, 5/5 ORT samples bit-exact vs SW ref, cos ≥ 0.99994 vs ORT (H=20 W=20 C=128 K=5 ROI=8x8).
+
+**To build (in recommended order):**
+1. **Upsample integration** *(small, mechanical)* — two neck points: backbone P4→P3 (after L39) and P3→detect (after L48). Each: `upsample2` then `concat_mux` with the P3/P4 skip-FIFO output. Leaf IPs ready.
+2. **Attention block (PSA / A2C2f)** *(medium)* — composes already-validated convs (L34-L38 model.10, L88-L92 model.22) with `softmax16` + fp16_fma attention scores. New work is the QKV split + attention-matmul + residuals around the proj and FFN convs (proj/FFN convs themselves already pass standalone).
+3. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
 
 ### Top-level integration (after all blocks)
 - `top.sv` that wires all 102+ layer instances in a streaming dataflow.
