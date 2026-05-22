@@ -1,0 +1,370 @@
+// Copyright (c) 2026 vibeyolo
+// SPDX-License-Identifier: Apache-2.0
+//
+// fp16_fma — IEEE-754 binary16 fused multiply-add: y = a*b + c.
+//
+// Single rounding step at the end (RNE). Subnormal inputs and outputs are
+// supported. Underflow flushes to zero (documented in README). Overflow ->
+// signed Inf. NaN propagates (canonical 0x7E00). Inf*0 -> NaN.
+// Inf+(-Inf) -> NaN. a*b == -0 and adding +0 -> +0 (default RNE rule).
+//
+// Strategy:
+//   1. Unpack a, b, c into (sign, 11-bit significand, signed effective
+//      exponent). value = sig11 * 2^eff_exp.
+//        normal:    sig11 = {1, frac10}, eff_exp = bexp - 25.
+//        subnormal: sig11 = {0, frac10}, eff_exp = -24.
+//        zero:      sig11 = 0 (handled by special-case path)
+//   2. Compute product sig_p = sig_a * sig_b (22 bits), e_p = e_a + e_b.
+//   3. Place product and c into a 100-bit shifted view. Reading off
+//      the top 50 bits is the accumulator window; bits below are sticky.
+//      Anchor exponent set so dominant operand's high bits land near
+//      the top of the window.
+//   4. Same-sign add or different-sign subtract on the 50-bit accumulators
+//      with sticky bits combined; track result sign.
+//   5. Leading-one detect, normalise, extract mantissa+guard+round+sticky,
+//      RNE round, repack. Handle subnormal-output via additional right
+//      shift before extraction.
+
+module fp16_fma (
+  input  logic        clk_i,
+  input  logic        rst_ni,
+
+  input  logic [15:0] a_i,
+  input  logic [15:0] b_i,
+  input  logic [15:0] c_i,
+
+  output logic [15:0] y_o
+);
+
+  // ───────────────────────── unpack ──────────────────────────
+  function automatic void unpack_fp16(
+      input  logic [15:0] x,
+      output logic        s,
+      output logic [10:0] sig,
+      output logic signed [7:0] eff_exp,
+      output logic        is_zero,
+      output logic        is_inf,
+      output logic        is_nan
+  );
+    logic [4:0] bexp;
+    logic [9:0] frac;
+    begin
+      s    = x[15];
+      bexp = x[14:10];
+      frac = x[9:0];
+      is_zero = (bexp == 5'd0)  && (frac == 10'd0);
+      is_inf  = (bexp == 5'd31) && (frac == 10'd0);
+      is_nan  = (bexp == 5'd31) && (frac != 10'd0);
+      if (bexp == 5'd0) begin
+        sig     = {1'b0, frac};
+        eff_exp = -8'sd24;
+      end else begin
+        sig     = {1'b1, frac};
+        eff_exp = $signed({3'b000, bexp}) - 8'sd25;
+      end
+    end
+  endfunction
+
+  logic        sa, sb, sc;
+  logic [10:0] siga, sigb, sigc;
+  logic signed [7:0] ea, eb, ec;
+  logic        a_zero, a_inf, a_nan;
+  logic        b_zero, b_inf, b_nan;
+  logic        c_zero, c_inf, c_nan;
+
+  always_comb begin
+    unpack_fp16(a_i, sa, siga, ea, a_zero, a_inf, a_nan);
+    unpack_fp16(b_i, sb, sigb, eb, b_zero, b_inf, b_nan);
+    unpack_fp16(c_i, sc, sigc, ec, c_zero, c_inf, c_nan);
+  end
+
+  // ───────────────────────── product ─────────────────────────
+  logic               sp;
+  logic [21:0]        sig_p;
+  logic signed [9:0]  ep;
+
+  assign sp    = sa ^ sb;
+  assign sig_p = siga * sigb;
+  assign ep    = $signed({{2{ea[7]}}, ea}) + $signed({{2{eb[7]}}, eb});
+
+  // Product is zero when either input is zero (or both subnormals
+  // multiply to all zero — but that's caught downstream via sig_p == 0).
+  logic prod_zero;
+  assign prod_zero = a_zero || b_zero || (sig_p == 22'd0);
+
+  // ────────────────────── special cases ──────────────────────
+  logic prod_is_inf;        // a*b is Inf (non-NaN path)
+  logic prod_is_nan_special;
+  assign prod_is_inf = (a_inf || b_inf) && !(a_zero || b_zero) && !(a_nan || b_nan);
+  assign prod_is_nan_special = (a_inf && b_zero) || (b_inf && a_zero);
+
+  logic out_is_nan;
+  assign out_is_nan = a_nan || b_nan || c_nan ||
+                      prod_is_nan_special ||
+                      (prod_is_inf && c_inf && (sp != sc));
+
+  logic out_is_inf;
+  assign out_is_inf = !out_is_nan && (prod_is_inf || c_inf);
+
+  logic out_inf_sign;
+  assign out_inf_sign = (c_inf && !prod_is_inf) ? sc : sp;
+
+  // c contribution is zero when c is zero.
+  logic c_is_zero_eff;
+  assign c_is_zero_eff = c_zero;
+
+  // ─────────────────────── alignment ────────────────────────
+  // Top exponents (rough — uses worst-case leading bit position, refined
+  // later by leading-one detect on the sum).
+  //   top_p = ep + 21 (bit 21 of sig_p, which is the worst-case top).
+  //   top_c = ec + 10 (bit 10 of sigc).
+  // We pick e_low so the dominant operand's worst-case top lands at acc
+  // bit 47, leaving room for one carry bit at the top.
+  logic signed [11:0] ep_ext, ec_ext;
+  assign ep_ext = $signed({{2{ep[9]}}, ep});
+  assign ec_ext = $signed({{4{ec[7]}}, ec});
+
+  logic signed [11:0] top_p, top_c;
+  assign top_p = ep_ext + 12'sd21;
+  assign top_c = ec_ext + 12'sd10;
+
+  logic               anchor_is_c;
+  assign anchor_is_c = (top_c > top_p);
+
+  logic signed [11:0] e_low;
+  assign e_low = (anchor_is_c ? top_c : top_p) - 12'sd47;
+
+  // Shifts of sig_p and sigc relative to e_low (signed; can be negative).
+  logic signed [11:0] sp_shift, sc_shift;
+  assign sp_shift = ep_ext - e_low;
+  assign sc_shift = ec_ext - e_low;
+
+  // Place each operand into a 100-bit working register. We anchor sig at
+  // bit 50 by default; shifting left by sh moves it to bit (50+sh). The
+  // top 50 bits [99:50] are the accumulator window; the bottom 50 bits
+  // [49:0] are the sticky region. Bits that fall off the bottom are
+  // captured in the sticky bit; bits that shift above bit 99 only happen
+  // if the operand's leading bit is above the anchor — guarded against
+  // by the anchor-swap.
+  //
+  // Use unsigned shift counts. When the signed shift is negative we use
+  // right-shift; when positive we use left-shift. Clip absurd magnitudes
+  // (which would only occur for the lesser operand) to a value larger
+  // than the wide register so the operand becomes "all sticky" / zero.
+  logic [99:0] wide_p, wide_c;
+
+  function automatic logic [99:0] place_op(
+      input  logic [21:0]        val,
+      input  logic signed [11:0] sh
+  );
+    logic [99:0] base;
+    logic [99:0] out;
+    int          mag;
+    begin
+      base = {78'd0, val} << 50;   // val at bits [71:50]
+      if (sh >= 0) begin
+        // left shift. By construction (anchor swap on top_p vs top_c)
+        // the leading bit cannot rise above wide bit 99.
+        mag = int'(sh);
+        if (mag > 99) out = 100'd0;
+        else          out = base << mag;
+      end else begin
+        mag = -int'(sh);
+        if (mag > 99) out = 100'd0;
+        else          out = base >> mag;
+      end
+      return out;
+    end
+  endfunction
+
+  assign wide_p = place_op(sig_p,                 sp_shift);
+  assign wide_c = place_op({11'd0, sigc},         sc_shift);
+
+  // (sigc is 11 bits; passed as a 22-bit value via zero-extension.)
+
+  // Mask out product or c contributions when their respective values
+  // are effectively zero (one of a/b zero, or c zero).
+  logic [99:0] wp, wc;
+  assign wp = prod_zero     ? 100'd0 : wide_p;
+  assign wc = c_is_zero_eff ? 100'd0 : wide_c;
+
+  // ─────────────────── add / subtract magnitudes ─────────────
+  // Do the add/sub in full 100-bit precision; we capture sticky only
+  // at the final mantissa extraction stage.
+  logic same_sign;
+  assign same_sign = (sp == sc);
+
+  logic ge_pc;
+  assign ge_pc = (wp >= wc);
+
+  logic [100:0] sum_add;       // 101 bits to capture carry
+  logic [99:0]  sum_sub;       // |wp - wc|
+
+  assign sum_add = {1'b0, wp} + {1'b0, wc};
+  assign sum_sub = ge_pc ? (wp - wc) : (wc - wp);
+
+  logic [100:0] mag_raw;       // 101-bit magnitude (signed-magnitude form)
+  logic         result_sign;
+  always_comb begin
+    if (same_sign) begin
+      mag_raw     = sum_add;
+      result_sign = sp;
+    end else begin
+      mag_raw     = {1'b0, sum_sub};
+      result_sign = ge_pc ? sp : sc;
+    end
+  end
+
+  // mag_raw bit i (for i in [0..99]) represents 2^((i-50) + e_low).
+  // Bit 100 is the same-sign carry → represents 2^(50 + e_low).
+  //
+  // Find leading-1: lz = number of leading zeros in mag_raw (0..101).
+  logic [7:0] lz;
+  logic       any_one;
+  always_comb begin
+    any_one = 1'b0;
+    lz      = 8'd101;
+    for (int i = 100; i >= 0; i--) begin
+      if (mag_raw[i] && !any_one) begin
+        any_one = 1'b1;
+        lz      = 8'(100 - i);
+      end
+    end
+  end
+
+  // Exponent of the leading-1: bit (100-lz) → e = (100-lz - 50) + e_low
+  //                                                = 50 - lz + e_low.
+  logic signed [11:0] e_msb;
+  assign e_msb = 12'sd50 - $signed({4'b0, lz}) + e_low;
+
+  // Normalise: shift mag_raw left by lz so leading-1 sits at bit 100.
+  logic [100:0] mag_norm_wide;
+  always_comb begin
+    if (lz >= 8'd101) mag_norm_wide = 101'd0;
+    else              mag_norm_wide = mag_raw << lz[6:0];
+  end
+
+  // We will extract 10 mantissa bits + guard + round + sticky from
+  // mag_norm_wide. With leading-1 at bit 100:
+  //   mantissa10 = bits[99:90]
+  //   guard      = bit[89]
+  //   round      = bit[88]
+  //   sticky     = OR(bits[87:0])
+  // Use mag_norm[100:0] but we'll alias to a 101-bit name `mag_norm`.
+  logic [100:0] mag_norm;
+  assign mag_norm = mag_norm_wide;
+
+  // Normal-output extraction (if e_msb >= -14):
+  //   mantissa10 = mag_norm[99:90]
+  //   guard      = mag_norm[89]
+  //   round      = mag_norm[88]
+  //   sticky     = OR(mag_norm[87:0])
+  //   biased exp = e_msb + 15
+  logic signed [11:0] biased_exp_pre;
+  assign biased_exp_pre = e_msb + 12'sd15;
+
+  // Subnormal path: if biased_exp_pre <= 0, right-shift mag_norm by
+  // (1 - biased_exp_pre). Then biased exp field is 0 and we read the
+  // mantissa from the same bit positions.
+  logic signed [11:0] sub_shift_s;
+  assign sub_shift_s = 12'sd1 - biased_exp_pre;
+
+  logic [7:0] sub_shift;
+  logic       is_sub_path;
+  always_comb begin
+    is_sub_path = (biased_exp_pre <= 12'sd0);
+    if (!is_sub_path) sub_shift = 8'd0;
+    else if (sub_shift_s > 12'sd101) sub_shift = 8'd101;
+    else sub_shift = 8'(sub_shift_s);
+  end
+
+  logic [100:0] mag_post;
+  logic         _unused_mag_post_top;
+  assign _unused_mag_post_top = mag_post[100];
+  logic         sub_dropped;
+  always_comb begin
+    mag_post    = mag_norm >> sub_shift[6:0];
+    sub_dropped = 1'b0;
+    for (int i = 0; i < 101; i++) begin
+      if ((8'(i) < sub_shift) && mag_norm[i]) sub_dropped = 1'b1;
+    end
+  end
+
+  logic [9:0] mant10;
+  logic       guard_b, round_b, sticky_b;
+  assign mant10   = mag_post[99:90];
+  assign guard_b  = mag_post[89];
+  assign round_b  = mag_post[88];
+  assign sticky_b = (|mag_post[87:0]) | sub_dropped;
+
+  // ─────────────────────── RNE round ────────────────────────
+  logic round_up;
+  assign round_up = guard_b && ((round_b | sticky_b) || mant10[0]);
+
+  logic [10:0] mant_rounded;
+  assign mant_rounded = {1'b0, mant10} + 11'(round_up);
+
+  // ─────────────────────── pack ─────────────────────────────
+  logic out_zero_exact;
+  assign out_zero_exact = !any_one && !out_is_nan && !out_is_inf;
+
+  logic signed [11:0] biased_exp_pack;
+  logic [9:0]         frac_final;
+  always_comb begin
+    if (is_sub_path) begin
+      // After the subnormal right-shift, the biased exp field is 0
+      // unless mantissa rounding promotes to smallest normal.
+      if (mant_rounded[10]) begin
+        biased_exp_pack = 12'sd1;
+        frac_final      = 10'd0;
+      end else begin
+        biased_exp_pack = 12'sd0;
+        frac_final      = mant_rounded[9:0];
+      end
+    end else begin
+      if (mant_rounded[10]) begin
+        biased_exp_pack = biased_exp_pre + 12'sd1;
+        frac_final      = 10'd0;
+      end else begin
+        biased_exp_pack = biased_exp_pre;
+        frac_final      = mant_rounded[9:0];
+      end
+    end
+  end
+
+  logic [15:0] y_d;
+  always_comb begin
+    if (out_is_nan) begin
+      y_d = 16'h7E00;
+    end else if (out_is_inf) begin
+      y_d = {out_inf_sign, 5'b11111, 10'b0};
+    end else if (out_zero_exact) begin
+      // RNE: exact-zero result from cancellation is +0.
+      y_d = 16'h0000;
+    end else if (biased_exp_pack >= 12'sd31) begin
+      y_d = {result_sign, 5'b11111, 10'b0};
+    end else if (biased_exp_pack <= 12'sd0) begin
+      // Flush-to-zero on extreme underflow only if mant_rounded is also
+      // zero (i.e., the subnormal-shift dropped everything). Otherwise
+      // emit a proper subnormal: biased exp field 0, frac = mantissa.
+      if (mant_rounded == 11'd0) begin
+        y_d = {result_sign, 15'd0};
+      end else begin
+        y_d = {result_sign, 5'd0, frac_final};
+      end
+    end else begin
+      y_d = {result_sign, biased_exp_pack[4:0], frac_final};
+    end
+  end
+
+  // ─── unused ─────
+  logic _unused;
+  assign _unused = ^{c_zero, ec_ext[11], ep_ext[11], 1'b0};
+
+  // ─────────────────────── register output ──────────────────
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) y_o <= 16'h0000;
+    else         y_o <= y_d;
+  end
+
+endmodule

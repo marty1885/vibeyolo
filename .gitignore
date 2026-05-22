@@ -1,0 +1,39 @@
+# Verilator build artifacts
+**/dv/build/
+**/dv/obj/
+**/dv/build_*/
+**/*.o
+**/*.d
+**/*.a
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Generated stimulus (re-derivable from extract.py)
+**/stim/*.hex
+**/stim/*.bin
+**/stim/*.npy
+**/stim/*.i8
+**/stim/*.f32
+**/stim/manifest.json
+
+# Large intermediate ONNX files (re-derivable)
+**/_model_with_intermediate.onnx
+
+# Coverage / lint
+**/coverage/
+**/*.dat
+**/*.coverage
+*.vcd
+*.fst
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
