@@ -204,3 +204,21 @@ verified `hw/ip/*` blocks under `scale_pkg::LAYER_<i>_*` parameters.
 - [x] L99  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.0 conv 80->80, s1, k3, 20²
 - [x] L100 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.1 conv 80->80, s1, k1, 20²
 - [x] L101 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.2                 conv 80->80, s1, k1, 20²
+
+## Chip top-level (frozen for PD)
+
+- [x] `hw/ip/yolo26n_top/` — frozen chip boundary for PD handoff.
+  - AXI4-Stream slave `s_axis_pix` (2 px/cycle RGB u8, SOF on TUSER[0], EOL on TLAST).
+  - AXI4-Stream master `m_axis_det` (1 det/beat: cls/score/xyxy fp16, TLAST=EOF).
+  - AXI4-Lite slave `s_axil` (12-bit addr, 32-bit data): CTRL/STATUS/TOPK/SCRATCH/ID/VERSION.
+  - Single clock domain, async-assert / sync-deassert reset, level-high IRQ.
+  - `yolo26n_top.sv` (boundary, FROZEN) + `yolo26n_csr.sv` (AXI-Lite regfile) + `yolo26n_core.sv` (skeletal shell — body grows as SPPF / upsample / attn / detect head / 102-layer wiring lands).
+  - Lints clean under verilator. PD owns the boundary from here; integration owns `yolo26n_core`.
+- [x] PD-friendliness pass on `yolo26n_top`:
+  - Added DFT bundle (`scan_en`, `scan_mode`, `test_clk`, `scan_in/out[N_SCAN_CHAINS]`, `bist_run/done/fail`).
+  - Internal `prim_rst_sync` (behavioral, PD swaps for tech cell) — boundary `rst_ni` is async-assert / sync-deassert.
+  - Internal `prim_clk_gate` on the core clock with `scan_en` bypass and `clk_gate_en_i` strap; CSR + AXIS skid stages stay on ungated `clk_i`.
+  - All AXIS pins flopped via `axis_skid` register slices (full-throughput 2-entry skid buffers, in + out).
+  - `(* keep_hierarchy = "yes" *)` on `yolo26n_core`.
+  - `MEMORIES.md` published — skip_p3 (410 KB) + skip_p4 (205 KB) flagged as the macros to commission first.
+  - `constraints/yolo26n_top.sdc` starter — clock defs, scan mode, IO budget, CSR false paths, dont-touch on core.
