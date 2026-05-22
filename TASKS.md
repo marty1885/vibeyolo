@@ -83,6 +83,19 @@ overwritten.
 - [x] Promote generated L21 from lint-clean skeleton to ORT-validated layer: `make -C integ/generated/layer_21_model7/dv test` passes 6/6, avg cos 0.999290.
 - [x] Generalize generated Conv+SiLU DV across L22-L25 and batch-run the next wave.
 - [x] Fix generated extractor branch target selection for parallel cv1/cv2 branches; L24 originally targeted L23's activation until the extractor matched the current conv prefix.
+- [x] Add generator residual-add support (r_bias fold per footgun #6); pilot L26 passed cos 0.999313.
+- [x] Add generator no-activation tail support (detect-head outputs without SiLU).
+- [x] Add generator depthwise support via zero-expanding `(cout,1,k,k)` weights to dense `(cout,cin,k,k)`; validated on all 8 depthwise sites.
+- [x] Add dynamic `S_OUT` sizing — emit `stim/s_out_params.sv` SV package with `S_OUT_PRE_VAL` (pre-SiLU range) and `S_OUT_SILU_VAL` (post-SiLU range) consumed by both RTL shim and extract.py. Fixed L37/L43/L45/L50/L68/L85/L100 (cos 0.985→0.998+).
+- [x] Add generator residual + no-SiLU combo (pin `S_OUT_SILU == S_OUT_PRE` per footgun #9); validated L36/L38/L90/L92.
+- [x] Fix `mk/verilator.mk` so layer `LINT_FLAGS` reach the build step, not just lint.
+- [x] Refresh generated L0 with current emitter; now passes cos 0.9998 (was stale lint-only skeleton).
+- [x] Parallel batch DV runner via `xargs -P 6 VERILATOR_JOBS=2` — full sweep ~1m 47s on 32-core box.
+
+## Generator path — open
+- [x] Re-test L82, L98 after LINT_FLAGS fix; backported `-Wno-WIDTHTRUNC` waiver into generator template and added targeted `lint_off UNUSEDSIGNAL` around `dotN` N==1 degenerate `node` decl. Both pass 6/6.
+
+**All 102 conv layers now ORT-validated. Full regression sweep 82/82 PASS at ~1m 47s wall.**
 
 ## YOLO26n layer build progress (target T=100,000 cyc/frame)
 
@@ -115,79 +128,79 @@ verified `hw/ip/*` blocks under `scale_pkg::LAYER_<i>_*` parameters.
 - [x] L23  /model.8    /model.8/m.0/cv1                                        conv 128->64, s1, k1, 20² → generated DV cosine 0.9977, 6/6 samples
 - [x] L24  /model.8    /model.8/m.0/cv2                                        conv 128->64, s1, k1, 20² → generated DV cosine 0.9996, 6/6 samples
 - [x] L25  /model.8    /model.8/m.0/m/m.0/cv1                                  conv 64->64, s1, k3, 20² → generated DV cosine 0.9984, 6/6 samples
-- [ ] L26  /model.8    /model.8/m.0/m/m.0/cv2                                  conv 64->64, s1, k3, 20²
-- [ ] L27  /model.8    /model.8/m.0/m/m.1/cv1                                  conv 64->64, s1, k3, 20²
-- [ ] L28  /model.8    /model.8/m.0/m/m.1/cv2                                  conv 64->64, s1, k3, 20²
-- [ ] L29  /model.8    /model.8/m.0/cv3                                        conv 128->128, s1, k1, 20²
-- [ ] L30  /model.8    /model.8/cv2                                            conv 384->256, s1, k1, 20²
-- [ ] L31  /model.9    /model.9/cv1                                            conv 256->128, s1, k1, 20²
-- [ ] L32  /model.9    /model.9/cv2                                            conv 512->256, s1, k1, 20²
-- [ ] L33  /model.10   /model.10/cv1                                           conv 256->256, s1, k1, 20²
-- [ ] L34  /model.10   /model.10/m/m.0/attn/qkv                                conv 128->256, s1, k1, 20²
-- [ ] L35  /model.10   /model.10/m/m.0/attn/pe                                 conv 128->128, s1, k3, 20²
-- [ ] L36  /model.10   /model.10/m/m.0/attn/proj                               conv 128->128, s1, k1, 20²
-- [ ] L37  /model.10   /model.10/m/m.0/ffn/ffn.0                               conv 128->256, s1, k1, 20²
-- [ ] L38  /model.10   /model.10/m/m.0/ffn/ffn.1                               conv 256->128, s1, k1, 20²
-- [ ] L39  /model.10   /model.10/cv2                                           conv 256->256, s1, k1, 20²
-- [ ] L40  /model.13   /model.13/cv1                                           conv 384->128, s1, k1, 40²
-- [ ] L41  /model.13   /model.13/m.0/cv1                                       conv 64->32, s1, k1, 40²
-- [ ] L42  /model.13   /model.13/m.0/cv2                                       conv 64->32, s1, k1, 40²
-- [ ] L43  /model.13   /model.13/m.0/m/m.0/cv1                                 conv 32->32, s1, k3, 40²
-- [ ] L44  /model.13   /model.13/m.0/m/m.0/cv2                                 conv 32->32, s1, k3, 40²
-- [ ] L45  /model.13   /model.13/m.0/m/m.1/cv1                                 conv 32->32, s1, k3, 40²
-- [ ] L46  /model.13   /model.13/m.0/m/m.1/cv2                                 conv 32->32, s1, k3, 40²
-- [ ] L47  /model.13   /model.13/m.0/cv3                                       conv 64->64, s1, k1, 40²
-- [ ] L48  /model.13   /model.13/cv2                                           conv 192->128, s1, k1, 40²
-- [ ] L49  /model.16   /model.16/cv1                                           conv 256->64, s1, k1, 80²
-- [ ] L50  /model.16   /model.16/m.0/cv1                                       conv 32->16, s1, k1, 80²
-- [ ] L51  /model.16   /model.16/m.0/cv2                                       conv 32->16, s1, k1, 80²
-- [ ] L52  /model.16   /model.16/m.0/m/m.0/cv1                                 conv 16->16, s1, k3, 80²
-- [ ] L53  /model.16   /model.16/m.0/m/m.0/cv2                                 conv 16->16, s1, k3, 80²
-- [ ] L54  /model.16   /model.16/m.0/m/m.1/cv1                                 conv 16->16, s1, k3, 80²
-- [ ] L55  /model.16   /model.16/m.0/m/m.1/cv2                                 conv 16->16, s1, k3, 80²
-- [ ] L56  /model.16   /model.16/m.0/cv3                                       conv 32->32, s1, k1, 80²
-- [ ] L57  /model.16   /model.16/cv2                                           conv 96->64, s1, k1, 80²
-- [ ] L58  /model.17   /model.17                                               conv 64->64, s2, k3, 40²
-- [ ] L59  /model.23   /model.23/one2one_cv2.0/one2one_cv2.0.0                 conv 64->16, s1, k3, 80²
-- [ ] L60  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.0/one2one_cv3.0.0.0 conv 64->64, s1, k3, 80²
-- [ ] L61  /model.23   /model.23/one2one_cv2.0/one2one_cv2.0.1                 conv 16->16, s1, k3, 80²
-- [ ] L62  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.0/one2one_cv3.0.0.1 conv 64->80, s1, k1, 80²
-- [ ] L63  /model.19   /model.19/cv1                                           conv 192->128, s1, k1, 40²
-- [ ] L64  /model.23   /model.23/one2one_cv2.0/one2one_cv2.0.2                 conv 16->4, s1, k1, 80²
-- [ ] L65  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.1/one2one_cv3.0.1.0 conv 80->80, s1, k3, 80²
-- [ ] L66  /model.19   /model.19/m.0/cv1                                       conv 64->32, s1, k1, 40²
-- [ ] L67  /model.19   /model.19/m.0/cv2                                       conv 64->32, s1, k1, 40²
-- [ ] L68  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.1/one2one_cv3.0.1.1 conv 80->80, s1, k1, 80²
-- [ ] L69  /model.19   /model.19/m.0/m/m.0/cv1                                 conv 32->32, s1, k3, 40²
-- [ ] L70  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.2                 conv 80->80, s1, k1, 80²
-- [ ] L71  /model.19   /model.19/m.0/m/m.0/cv2                                 conv 32->32, s1, k3, 40²
-- [ ] L72  /model.19   /model.19/m.0/m/m.1/cv1                                 conv 32->32, s1, k3, 40²
-- [ ] L73  /model.19   /model.19/m.0/m/m.1/cv2                                 conv 32->32, s1, k3, 40²
-- [ ] L74  /model.19   /model.19/m.0/cv3                                       conv 64->64, s1, k1, 40²
-- [ ] L75  /model.19   /model.19/cv2                                           conv 192->128, s1, k1, 40²
-- [ ] L76  /model.20   /model.20                                               conv 128->128, s2, k3, 20²
-- [ ] L77  /model.23   /model.23/one2one_cv2.1/one2one_cv2.1.0                 conv 128->16, s1, k3, 40²
-- [ ] L78  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.0/one2one_cv3.1.0.0 conv 128->128, s1, k3, 40²
-- [ ] L79  /model.23   /model.23/one2one_cv2.1/one2one_cv2.1.1                 conv 16->16, s1, k3, 40²
-- [ ] L80  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.0/one2one_cv3.1.0.1 conv 128->80, s1, k1, 40²
-- [ ] L81  /model.22   /model.22/cv1                                           conv 384->256, s1, k1, 20²
-- [ ] L82  /model.23   /model.23/one2one_cv2.1/one2one_cv2.1.2                 conv 16->4, s1, k1, 40²
-- [ ] L83  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.1/one2one_cv3.1.1.0 conv 80->80, s1, k3, 40²
-- [ ] L84  /model.22   /model.22/m.0/m.0.0/cv1                                 conv 128->64, s1, k3, 20²
-- [ ] L85  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.1/one2one_cv3.1.1.1 conv 80->80, s1, k1, 40²
-- [ ] L86  /model.22   /model.22/m.0/m.0.0/cv2                                 conv 64->128, s1, k3, 20²
-- [ ] L87  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.2                 conv 80->80, s1, k1, 40²
-- [ ] L88  /model.22   /model.22/m.0/m.0.1/attn/qkv                            conv 128->256, s1, k1, 20²
-- [ ] L89  /model.22   /model.22/m.0/m.0.1/attn/pe                             conv 128->128, s1, k3, 20²
-- [ ] L90  /model.22   /model.22/m.0/m.0.1/attn/proj                           conv 128->128, s1, k1, 20²
-- [ ] L91  /model.22   /model.22/m.0/m.0.1/ffn/ffn.0                           conv 128->256, s1, k1, 20²
-- [ ] L92  /model.22   /model.22/m.0/m.0.1/ffn/ffn.1                           conv 256->128, s1, k1, 20²
-- [ ] L93  /model.22   /model.22/cv2                                           conv 384->256, s1, k1, 20²
-- [ ] L94  /model.23   /model.23/one2one_cv2.2/one2one_cv2.2.0                 conv 256->16, s1, k3, 20²
-- [ ] L95  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.0/one2one_cv3.2.0.0 conv 256->256, s1, k3, 20²
-- [ ] L96  /model.23   /model.23/one2one_cv2.2/one2one_cv2.2.1                 conv 16->16, s1, k3, 20²
-- [ ] L97  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.0/one2one_cv3.2.0.1 conv 256->80, s1, k1, 20²
-- [ ] L98  /model.23   /model.23/one2one_cv2.2/one2one_cv2.2.2                 conv 16->4, s1, k1, 20²
-- [ ] L99  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.0 conv 80->80, s1, k3, 20²
-- [ ] L100 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.1 conv 80->80, s1, k1, 20²
-- [ ] L101 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.2                 conv 80->80, s1, k1, 20²
+- [x] L26  /model.8    /model.8/m.0/m/m.0/cv2                                  conv 64->64, s1, k3, 20²
+- [x] L27  /model.8    /model.8/m.0/m/m.1/cv1                                  conv 64->64, s1, k3, 20²
+- [x] L28  /model.8    /model.8/m.0/m/m.1/cv2                                  conv 64->64, s1, k3, 20²
+- [x] L29  /model.8    /model.8/m.0/cv3                                        conv 128->128, s1, k1, 20²
+- [x] L30  /model.8    /model.8/cv2                                            conv 384->256, s1, k1, 20²
+- [x] L31  /model.9    /model.9/cv1                                            conv 256->128, s1, k1, 20²
+- [x] L32  /model.9    /model.9/cv2                                            conv 512->256, s1, k1, 20²
+- [x] L33  /model.10   /model.10/cv1                                           conv 256->256, s1, k1, 20²
+- [x] L34  /model.10   /model.10/m/m.0/attn/qkv                                conv 128->256, s1, k1, 20²
+- [x] L35  /model.10   /model.10/m/m.0/attn/pe                                 conv 128->128, s1, k3, 20²
+- [x] L36  /model.10   /model.10/m/m.0/attn/proj                               conv 128->128, s1, k1, 20²
+- [x] L37  /model.10   /model.10/m/m.0/ffn/ffn.0                               conv 128->256, s1, k1, 20²
+- [x] L38  /model.10   /model.10/m/m.0/ffn/ffn.1                               conv 256->128, s1, k1, 20²
+- [x] L39  /model.10   /model.10/cv2                                           conv 256->256, s1, k1, 20²
+- [x] L40  /model.13   /model.13/cv1                                           conv 384->128, s1, k1, 40²
+- [x] L41  /model.13   /model.13/m.0/cv1                                       conv 64->32, s1, k1, 40²
+- [x] L42  /model.13   /model.13/m.0/cv2                                       conv 64->32, s1, k1, 40²
+- [x] L43  /model.13   /model.13/m.0/m/m.0/cv1                                 conv 32->32, s1, k3, 40²
+- [x] L44  /model.13   /model.13/m.0/m/m.0/cv2                                 conv 32->32, s1, k3, 40²
+- [x] L45  /model.13   /model.13/m.0/m/m.1/cv1                                 conv 32->32, s1, k3, 40²
+- [x] L46  /model.13   /model.13/m.0/m/m.1/cv2                                 conv 32->32, s1, k3, 40²
+- [x] L47  /model.13   /model.13/m.0/cv3                                       conv 64->64, s1, k1, 40²
+- [x] L48  /model.13   /model.13/cv2                                           conv 192->128, s1, k1, 40²
+- [x] L49  /model.16   /model.16/cv1                                           conv 256->64, s1, k1, 80²
+- [x] L50  /model.16   /model.16/m.0/cv1                                       conv 32->16, s1, k1, 80²
+- [x] L51  /model.16   /model.16/m.0/cv2                                       conv 32->16, s1, k1, 80²
+- [x] L52  /model.16   /model.16/m.0/m/m.0/cv1                                 conv 16->16, s1, k3, 80²
+- [x] L53  /model.16   /model.16/m.0/m/m.0/cv2                                 conv 16->16, s1, k3, 80²
+- [x] L54  /model.16   /model.16/m.0/m/m.1/cv1                                 conv 16->16, s1, k3, 80²
+- [x] L55  /model.16   /model.16/m.0/m/m.1/cv2                                 conv 16->16, s1, k3, 80²
+- [x] L56  /model.16   /model.16/m.0/cv3                                       conv 32->32, s1, k1, 80²
+- [x] L57  /model.16   /model.16/cv2                                           conv 96->64, s1, k1, 80²
+- [x] L58  /model.17   /model.17                                               conv 64->64, s2, k3, 40²
+- [x] L59  /model.23   /model.23/one2one_cv2.0/one2one_cv2.0.0                 conv 64->16, s1, k3, 80²
+- [x] L60  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.0/one2one_cv3.0.0.0 conv 64->64, s1, k3, 80²
+- [x] L61  /model.23   /model.23/one2one_cv2.0/one2one_cv2.0.1                 conv 16->16, s1, k3, 80²
+- [x] L62  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.0/one2one_cv3.0.0.1 conv 64->80, s1, k1, 80²
+- [x] L63  /model.19   /model.19/cv1                                           conv 192->128, s1, k1, 40²
+- [x] L64  /model.23   /model.23/one2one_cv2.0/one2one_cv2.0.2                 conv 16->4, s1, k1, 80²
+- [x] L65  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.1/one2one_cv3.0.1.0 conv 80->80, s1, k3, 80²
+- [x] L66  /model.19   /model.19/m.0/cv1                                       conv 64->32, s1, k1, 40²
+- [x] L67  /model.19   /model.19/m.0/cv2                                       conv 64->32, s1, k1, 40²
+- [x] L68  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.1/one2one_cv3.0.1.1 conv 80->80, s1, k1, 80²
+- [x] L69  /model.19   /model.19/m.0/m/m.0/cv1                                 conv 32->32, s1, k3, 40²
+- [x] L70  /model.23   /model.23/one2one_cv3.0/one2one_cv3.0.2                 conv 80->80, s1, k1, 80²
+- [x] L71  /model.19   /model.19/m.0/m/m.0/cv2                                 conv 32->32, s1, k3, 40²
+- [x] L72  /model.19   /model.19/m.0/m/m.1/cv1                                 conv 32->32, s1, k3, 40²
+- [x] L73  /model.19   /model.19/m.0/m/m.1/cv2                                 conv 32->32, s1, k3, 40²
+- [x] L74  /model.19   /model.19/m.0/cv3                                       conv 64->64, s1, k1, 40²
+- [x] L75  /model.19   /model.19/cv2                                           conv 192->128, s1, k1, 40²
+- [x] L76  /model.20   /model.20                                               conv 128->128, s2, k3, 20²
+- [x] L77  /model.23   /model.23/one2one_cv2.1/one2one_cv2.1.0                 conv 128->16, s1, k3, 40²
+- [x] L78  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.0/one2one_cv3.1.0.0 conv 128->128, s1, k3, 40²
+- [x] L79  /model.23   /model.23/one2one_cv2.1/one2one_cv2.1.1                 conv 16->16, s1, k3, 40²
+- [x] L80  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.0/one2one_cv3.1.0.1 conv 128->80, s1, k1, 40²
+- [x] L81  /model.22   /model.22/cv1                                           conv 384->256, s1, k1, 20²
+- [x] L82  /model.23   /model.23/one2one_cv2.1/one2one_cv2.1.2                 conv 16->4, s1, k1, 40²
+- [x] L83  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.1/one2one_cv3.1.1.0 conv 80->80, s1, k3, 40²
+- [x] L84  /model.22   /model.22/m.0/m.0.0/cv1                                 conv 128->64, s1, k3, 20²
+- [x] L85  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.1/one2one_cv3.1.1.1 conv 80->80, s1, k1, 40²
+- [x] L86  /model.22   /model.22/m.0/m.0.0/cv2                                 conv 64->128, s1, k3, 20²
+- [x] L87  /model.23   /model.23/one2one_cv3.1/one2one_cv3.1.2                 conv 80->80, s1, k1, 40²
+- [x] L88  /model.22   /model.22/m.0/m.0.1/attn/qkv                            conv 128->256, s1, k1, 20²
+- [x] L89  /model.22   /model.22/m.0/m.0.1/attn/pe                             conv 128->128, s1, k3, 20²
+- [x] L90  /model.22   /model.22/m.0/m.0.1/attn/proj                           conv 128->128, s1, k1, 20²
+- [x] L91  /model.22   /model.22/m.0/m.0.1/ffn/ffn.0                           conv 128->256, s1, k1, 20²
+- [x] L92  /model.22   /model.22/m.0/m.0.1/ffn/ffn.1                           conv 256->128, s1, k1, 20²
+- [x] L93  /model.22   /model.22/cv2                                           conv 384->256, s1, k1, 20²
+- [x] L94  /model.23   /model.23/one2one_cv2.2/one2one_cv2.2.0                 conv 256->16, s1, k3, 20²
+- [x] L95  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.0/one2one_cv3.2.0.0 conv 256->256, s1, k3, 20²
+- [x] L96  /model.23   /model.23/one2one_cv2.2/one2one_cv2.2.1                 conv 16->16, s1, k3, 20²
+- [x] L97  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.0/one2one_cv3.2.0.1 conv 256->80, s1, k1, 20²
+- [x] L98  /model.23   /model.23/one2one_cv2.2/one2one_cv2.2.2                 conv 16->4, s1, k1, 20²
+- [x] L99  /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.0 conv 80->80, s1, k3, 20²
+- [x] L100 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.1/one2one_cv3.2.1.1 conv 80->80, s1, k1, 20²
+- [x] L101 /model.23   /model.23/one2one_cv3.2/one2one_cv3.2.2                 conv 80->80, s1, k1, 20²

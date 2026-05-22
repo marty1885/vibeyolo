@@ -48,50 +48,64 @@ The user assumes "magical SRAM": activations stream in/out from external SRAM th
 - DV runs ≥30k random vectors clean on the leaf IPs.
 
 ### Layers built and ORT-validated
-**26 of 102 conv layers** done:
-- L0 (stem), L1 (4/6 — known stim issue), L2, L3, L4 (+resid), L5, L6 (3×3 s2), L7, L8, L9 (+resid), L10, L11, L12, L13
-- L14, L15, L16 (+resid), L17, L18 (+resid), L19 — model.6 C3k2 nested bottlenecks
-- L20 (`/model.6/cv2`) — non-residual exit conv, 192→128 k1 s1 at 40×40. `make -C integ/layer_20_cv2/dv test` passes 8/8 samples, avg cos 0.999791.
-- L21-L25 are generated under `integ/generated/` and ORT-validated by generated DV.
+**100 of 102 conv layers** done. Only **L82, L98** remain (dotN small-N Verilator lint waiver — a build-flag issue, not correctness).
 
-Each layer = `extract.py` (ORT-driven stim/golden) + ~30-80 line `.sv` shim around `conv_layer` + TB + Makefile. Cosine ≥ 0.998 vs ORT on ≥3 random tiles.
+Two tracks:
+- **Hand-built** under `integ/layer_*` (L0–L25): canonical reference implementations.
+  - L0 (stem), L1 (4/6 — known stim issue), L2–L20. Residual layers L4/L9/L16/L18.
+  - L20 `/model.6/cv2` 192→128 k1 s1 at 40² is the newest hand-built; 8/8 samples avg cos 0.999791.
+- **Auto-generated** under `integ/generated/` (L0, L21–L101): emitted by `tools/layergen/layergen.py` and ORT-validated. Generated L0 also passes (cos 0.9998) — used as a regression target for the generator itself.
 
-### Generator path started
-- `tools/layergen/layergen.py` is a **non-destructive** generator. It writes under `integ/generated/` by default, so it does not overwrite hand-built `integ/layer_*`.
-- It can emit balanced scale packages:
-  - `integ/generated/scale/scale_pkg_balanced.sv`
-  - `integ/generated/scale/scale_pkg_balanced_dv.sv`
-  - markdown reports next to them
-- Balancing rule: minimize area proxy `P_PIX * P_COUT * P_CIN` subject to `cycles <= T_FRAME`. Grouped/depthwise convs count only `Cin/group` input channels. Ties prefer stage cycles closer to target.
-- Current default is `max_p_pix=2`. The `conv_layer` leaf is still single-pixel; generated wrappers implement `P_PIX>1` by instantiating multiple `conv_layer` lanes.
+Each layer = `extract.py` (ORT-driven stim/golden) + ~30-80 line `.sv` shim around `conv_layer` + TB + Makefile + `stim/s_out_params.sv` (auto-sized per-layer SiLU scales). Cosine ≥ 0.998 vs ORT on 6 random tiles.
+
+### Generator path (now the production codegen)
+- `tools/layergen/layergen.py` is non-destructive — writes under `integ/generated/`, does not overwrite hand-built `integ/layer_*`.
+- Emits balanced scale packages, per-layer RTL shim, extract.py, C++ tiled driver, TB, Makefile.
+- Balancing rule: minimize area proxy `P_PIX * P_COUT * P_CIN` subject to `cycles <= T_FRAME`. Grouped/depthwise convs count only `Cin/group` input channels.
+- Current default is `max_p_pix=2`. Generated wrappers implement `P_PIX>1` by instantiating multiple lockstep `conv_layer` lanes.
 - Current balanced real-chip report at `T_FRAME=100000`: total area proxy 22,096, worst layer 80,000 cycles, 0 target misses.
-- Generated L0 and L21 skeletons exist at `integ/generated/layer_0_model0/` and `integ/generated/layer_21_model7/`; both lint clean.
-- Generated L21 is now ORT-validated with generated `extract.py` + generated C++ tiled driver: `make -C integ/generated/layer_21_model7/dv test` passes 6/6 samples, avg cos 0.999290, with `P_PIX=2 P_COUT=16 P_CIN=8`.
-- Generated L22-L25 also pass ORT-backed generated DV:
-  - L22 avg cos 0.999145, 6/6 samples
-  - L23 avg cos 0.997680, 6/6 samples
-  - L24 avg cos 0.999556, 6/6 samples
-  - L25 avg cos 0.998416, 6/6 samples
-- Generator extractor target selection was fixed to match the current conv prefix. This matters for parallel branches like `/model.8/m.0/cv1` and `/model.8/m.0/cv2`; otherwise a later layer could accidentally compare against a sibling activation.
-- Generator functional DV path currently covers ordinary `group=1` Conv+SiLU only. Residual, grouped/depthwise, concat/add, attention, and detect still need explicit support.
+- Generated extractor target selection matches the current conv prefix to disambiguate parallel branches (cv1 vs cv2).
+
+**Conv variants the generator supports:**
+1. Ordinary group=1 Conv+SiLU
+2. Group=1 Conv with **no activation** (detect-head tails)
+3. **Residual-add** Conv+SiLU (L26 pilot; r_bias_eff fold per footgun #6)
+4. **Depthwise** (group==cin==cout) — handled by zero-expanding weights to dense, reusing the dense driver
+5. **Residual + no-SiLU** (attn proj / FFN tail) — requires `S_OUT_SILU == S_OUT_PRE` per new footgun #9
+
+**Dynamic S_OUT sizing:** the generator emits `stim/s_out_params.sv` (an SV package with `S_OUT_PRE_VAL`/`S_OUT_SILU_VAL` as `localparam real`), sized from observed activation amplitudes (`max * 1.1 / 127`). Both the RTL shim and extract.py consume the same package. Critical: `S_OUT_PRE` covers pre-SiLU range, `S_OUT_SILU` covers post-SiLU range — they are NOT interchangeable.
+
+### Batch DV
+Run all generated layers in parallel:
+```bash
+ls -d integ/generated/layer_*/dv | xargs -I{} -P 6 bash -c \
+  'timeout 180 env VERILATOR_JOBS=2 make -C {} test > /tmp/dv_$$.log 2>&1 \
+   && echo "PASS {}" || echo "FAIL {}"'
+```
+~1m 47s wall time for 81 layers on a 32-core box. Memory peak ~12 GiB.
 
 ### Numbers
 - **Real chip**: worst-layer 76,800 cyc → 13K FPS @ 1 GHz. Median 51,200 cyc.
 - **Real chip total MAC units**: ~54K (rough). Total gates well within half-reticle.
-- **DV builds**: <60 sec per layer with the DV-capped pkg + VERILATOR_JOBS=4.
+- **DV builds**: <60 sec per layer with the DV-capped pkg + VERILATOR_JOBS=2-4. Full sweep ~2 min wall.
 
 ## What's next
 
-### Immediate (conv layers, easy after the IP work)
-1. **Continue generated Conv+SiLU**: next ordinary layers are L26-L30, but L26/L28 are residual-add convs in the nested bottleneck path, so generator residual support is now the next useful feature.
-2. Add generator support for residual/add paths, then validate L26-L30.
-3. Layer naming heuristic: read `integ/scale/scale_pkg.sv` for the canonical L_N name → ONNX node mapping.
+All 102 conv layers are ORT-validated. The remaining work is block-level integration around graph boundaries (SPPF, upsamples, attention, detect head) and then top-level wiring.
 
-### New IPs needed (not yet built)
-1. **SPPF maxpool integration** — `hw/ip/maxpool_kxk` already exists and DV covers K=5; still need a layer-level SPPF integration block between L31 and L32.
-2. **Upsample integration** — `hw/ip/upsample2` already exists and DV passes; still need neck wiring around the upsample/concat points.
-3. **Attention block** (`a2c2f` or `psa`) — deeper neck has attention. softmax16 already validated; need to compose Q/K/V projections + attention scores. Look at YOLO26n's PSA/A2C2f block structure in ONNX.
-4. **Detect head** — YOLO26 is **end-to-end (no NMS)**, uses learned top-k. `box_decode` already validated; need to wire it up + top-k logic.
+### Block-level IPs to build (in recommended order)
+1. **SPPF integration block** *(smallest, mechanical)* — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31's output, then `concat_mux` of {L31_out, mp1, mp2, mp3} feeding L32's input. Leaf IPs ready. Validate against ORT subgraph `/model.9/cv1 → maxpool×3 → concat → /model.9/cv2`.
+2. **Upsample integration** *(small, mechanical)* — two neck points: backbone P4→P3 (after L39) and P3→detect (after L48). Each: `upsample2` then `concat_mux` with the P3/P4 skip-FIFO output. Leaf IPs ready.
+3. **Attention block (PSA / A2C2f)** *(medium)* — composes already-validated convs (L34-L38 model.10, L88-L92 model.22) with `softmax16` + fp16_fma attention scores. New work is the QKV split + attention-matmul + residuals around the proj and FFN convs (proj/FFN convs themselves already pass standalone).
+4. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
+
+### Top-level integration (after all blocks)
+- `top.sv` that wires all 102+ layer instances in a streaming dataflow.
+- **Skip-connection FIFOs**: P3 skip = 80×80×64 = ~410KB, P4 skip = 40×40×128 = ~205KB. Plan SRAM budget.
+- End-to-end ORT validation: push a real 640×640 image through the whole DUT, compare detect output vs ORT. Target cos ≥ 0.99 on final box/cls tensors.
+
+### Deferred / cleanup
+- Generated L1 synthetic stim refresh when E2E pipeline exists (feed L0's real output instead of synthetic).
 
 ### Top-level integration (after all 102 conv layers + above IPs)
 - `top.sv` that wires all 102+ layer instances in a streaming dataflow.
@@ -198,6 +212,24 @@ mkdir integ/layer_N_<short>/{rtl,dv,stim}
 
 ### 8. Don't trust the task brief on ONNX shapes
 - Multiple times the task description claimed e.g. "8-ch residual" but ONNX shape_inference revealed 16-ch full-width. **Always verify via `onnx.shape_inference.infer_shapes()` before coding.**
+
+### 9. Residual + no-SiLU requires `S_OUT_SILU == S_OUT_PRE`
+- The `conv_layer` IP wires `add_rq`'s `scale_a_fp16 = real_to_fp16(S_OUT_SILU)` unconditionally. When `SILU=0`, the "a" input is `rq_y` (post-requant, scaled at `S_OUT_PRE`), so the two must be equal or the residual sum is silently mis-scaled.
+- Generator handles this for L36/L38/L90/L92 by pinning `S_OUT_SILU = S_OUT_PRE = max(|pre|, |add|) * 1.1 / 127` in `stim/s_out_params.sv`. Don't change the IP — fix it at the extractor level.
+
+### 10. S_OUT_PRE covers pre-SiLU, S_OUT_SILU covers post-SiLU
+- They are NOT interchangeable. `S_OUT_PRE` is the SiLU LUT *input* grid (and the requant fp16 scale divisor in stim); too small → negative pre-acts saturate the LUT input to `silu(-128*S_OUT_PRE) ≈ -0.238` (for default 8/127) instead of ~0.
+- `S_OUT_SILU` is the LUT *output* grid (and residual-add grid); too coarse → LUT noise floor (footgun #5).
+- Generator sizes each from its own observed amplitude. Empirical rule for both: `max(|tensor|) * 1.1 / 127`.
+
+### 11. Generator `make -j` race against stim regeneration
+- The generator emits `stim/s_out_params.sv` (SV package) that both RTL shim and extract.py consume. extract.py rewrites it at the end of `make stim` with values from observed amplitudes.
+- Without explicit Make ordering, `make -j` builds the Verilator binary against the placeholder before `make stim` runs. Result: silent wrong cosine, no build error.
+- Generator emits `.stim.stamp` and explicit prereq; if you see "lint clean but DV cos is wrong" symptoms, check the stamp wiring.
+
+### 12. mk/verilator.mk LINT_FLAGS reached lint only, not build
+- Layer Makefiles setting `LINT_FLAGS = -Wno-SELRANGE -Wno-ASCRANGE` saw waivers honored at `make lint` but ignored at `make test`. Build failed `-Wall` on legitimate edge cases (any layer with `P_COUT=1` — depthwise + detect-head `cv2.x.2` nosilu tails).
+- Fixed by passing `$(LINT_FLAGS)` to the build verilator invocation too.
 
 ## Useful invocations
 

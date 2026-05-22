@@ -85,7 +85,13 @@ module dotN #(
   // node[0][.] is the product layer (combinational view of prod_q).
   // node[s][.] for s in 1..LEVELS is the s-th adder-tree register layer.
 
+  // verilator lint_off UNUSEDSIGNAL
+  // When N==1 (LEVELS==0) the adder tree is bypassed entirely and `node`
+  // is unused — output comes straight from prod_q[0]. Suppress the lint
+  // here so degenerate small-N instantiations (e.g. detect-head k1 exit
+  // convs with P_CIN=1) build under -Wall.
   logic signed [31:0] node [LEVELS+1][N];
+  // verilator lint_on UNUSEDSIGNAL
 
   // Level 0: feed in registered products.
   always_comb begin

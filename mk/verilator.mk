@@ -30,6 +30,14 @@
 REPO_ROOT ?= $(shell git rev-parse --show-toplevel)
 VERILATOR ?= verilator
 VERILATOR_JOBS ?= $(shell procs=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1); jobs=$$((procs * 4 / 5)); if [ $$jobs -lt 1 ]; then jobs=1; fi; echo $$jobs)
+# Optional simulation-time threading. Set VERILATOR_THREADS to >1 in a
+# Makefile (before including this file) to build a multi-threaded sim.
+VERILATOR_THREADS ?= 1
+ifneq ($(VERILATOR_THREADS),1)
+THREAD_FLAGS := --threads $(VERILATOR_THREADS)
+else
+THREAD_FLAGS :=
+endif
 XRAND_FLAGS ?= --x-initial unique
 XRAND_SEED  ?= 1
 XRAND_ARGS  ?= +verilator+rand+reset+2 +verilator+seed+$(XRAND_SEED)
@@ -38,6 +46,7 @@ BUILD_DIR  ?= $(CURDIR)/build
 
 COMMON_FLAGS := \
   -sv --cc --exe --build -j $(VERILATOR_JOBS) \
+  $(THREAD_FLAGS) \
   -Wall \
   --assert \
   --coverage \
@@ -159,7 +168,7 @@ lint:
 
 $(OBJ_DIR)/V$(TB_TOP): $(RTL_SRCS) $(CC_SRCS)
 	@mkdir -p $(BUILD_DIR)
-	$(VERILATOR) $(COMMON_FLAGS) \
+	$(VERILATOR) $(COMMON_FLAGS) $(LINT_FLAGS) \
 	  --Mdir $(OBJ_DIR) \
 	  $(addprefix -I,$(INCDIRS)) \
 	  --top-module $(TB_TOP) \
