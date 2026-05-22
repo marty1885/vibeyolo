@@ -97,9 +97,10 @@ All 102 conv layers are ORT-validated. The remaining work is block-level integra
 
 **Done:**
 - [x] **SPPF integration block** (`integ/sppf_model9/`) — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31's output, then `concat_mux` of {L31_out, mp1, mp2, mp3} feeding L32's input. 10/10 checks, 5/5 ORT samples bit-exact vs SW ref, cos ≥ 0.99994 vs ORT (H=20 W=20 C=128 K=5 ROI=8x8).
+- [x] **Upsample integration — `/model.11` + `/model.12`** (`integ/upsample_model11/`) — P4→P3 neck join after L39. Nearest-neighbour 2x upsample of /model.10/cv2 (256ch, 20²) then channel-concat with /model.6/cv2 P3 skip (128ch, 40²) → 384ch 40² feeding L40 (/model.13/cv1). Frame-store + drain design (mirrors SPPF — does NOT use the byte-serial `concat_mux` or single-channel `upsample2` IPs; channel-parallel wide bus). Both inputs share a per-sample S_OUT covering the joint range (real chip would do an upstream per-stream fp16 rescale). 10/10 checks, 5/5 samples bit-exact vs SW int8 golden, cos vs ORT 0.9995..0.9998 across all samples (3/3 random tiles ≥ 0.998).
 
 **To build (in recommended order):**
-1. **Upsample integration** *(small, mechanical)* — two neck points: backbone P4→P3 (after L39) and P3→detect (after L48). Each: `upsample2` then `concat_mux` with the P3/P4 skip-FIFO output. Leaf IPs ready.
+1. **Upsample integration — `/model.14` + `/model.15`** *(small, mechanical)* — second neck point (P3→detect) after L48. Same shape pattern as model.11 block above: NN 2x upsample of /model.13/cv2 (128ch, 40²) then concat with /model.4/cv2 P3 skip (128ch, 80²) → 256ch 80² feeding L49. Likely a clone of `integ/upsample_model11/` with parameter changes; verify shapes via `onnx.shape_inference.infer_shapes()` first.
 2. **Attention block (PSA / A2C2f)** *(medium)* — composes already-validated convs (L34-L38 model.10, L88-L92 model.22) with `softmax16` + fp16_fma attention scores. New work is the QKV split + attention-matmul + residuals around the proj and FFN convs (proj/FFN convs themselves already pass standalone).
 3. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
 

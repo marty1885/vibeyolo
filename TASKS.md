@@ -208,7 +208,8 @@ verified `hw/ip/*` blocks under `scale_pkg::LAYER_<i>_*` parameters.
 ## Block-level integration
 
 - [x] **SPPF block** (`integ/sppf_model9/`) — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31 output, then `concat_mux` of {L31, mp1, mp2, mp3} feeding L32. 10/10 checks, 5/5 ORT samples bit-exact vs SW ref, cos ≥ 0.99994 vs ORT (H=20 W=20 C=128 K=5).
-- [ ] **Upsample integration** — two neck points: P4→P3 after L39, P3→detect after L48. `upsample2` + `concat_mux` with skip-FIFO.
+- [x] **Upsample integration — P4→P3 (`/model.11` + `/model.12`)** (`integ/upsample_model11/`) — frame-store NN 2x upsample of /model.10/cv2 (256ch, 20²) followed by channel-concat with /model.6/cv2 P3 skip (128ch, 40²) → 384ch 40². 10/10 checks, 5/5 samples bit-exact vs SW int8 golden, cos vs ORT range 0.9995..0.9998 (3/3 random tiles ≥ 0.998). Second neck point (P3→detect after L48 / `/model.14`) still to build.
+- [ ] **Upsample integration — P3→detect** — second neck point after L48 (`/model.14` Resize + `/model.15` Concat). Same pattern as the model.11 block above.
 - [ ] **Attention block** (PSA / A2C2f) — QKV split + attention-matmul + softmax around already-validated proj/FFN convs.
 - [ ] **Detect head with learned top-k** — end-to-end, no NMS. Largest remaining technical risk.
 
