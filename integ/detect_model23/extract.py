@@ -157,8 +157,10 @@ def sw_int8_head(box_i8, cls_i8, S_box, S_cls):
     # box: dequant ltrb -> fp16, affine in fp16
     ltrb = np.empty((4, N_ANCHOR), np.float32)
     off = 0
+    # Mirror the hardware: scales enter as fp16, so dequant uses fp16(S).
     for nm, g, stride, n in SCALES:
-        ltrb[:, off:off+n] = fp16(box_i8[nm].reshape(4, -1).astype(np.float32) * S_box[nm])
+        sb = np.float32(np.float16(S_box[nm]))
+        ltrb[:, off:off+n] = fp16(box_i8[nm].reshape(4, -1).astype(np.float32) * sb)
         off += n
     l, t, r, b = ltrb
     x1 = fp16(fp16(ax - l) * st); y1 = fp16(fp16(ay - t) * st)
@@ -179,8 +181,9 @@ def sw_int8_head(box_i8, cls_i8, S_box, S_cls):
         score_i8[off:off+n] = blk.max(axis=1)
         scale_of[off:off+n] = si
         off += n
-    # dequant score to common fp16 using each anchor's originating scale
-    Scl = np.array([S_cls[s[0]] for s in SCALES], np.float32)
+    # dequant score to common fp16 using each anchor's originating scale.
+    # fp16(S) mirrors the hardware so DUT/ref topk selection matches bit-exactly.
+    Scl = np.array([np.float16(S_cls[s[0]]) for s in SCALES], np.float32)
     score_f16 = fp16(score_i8.astype(np.float32) * Scl[scale_of])
     idx = topk_minheap(score_f16, K_TOPK)
     # gather
@@ -304,6 +307,10 @@ def main():
 
     with open(os.path.join(STIM, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+    # Flat scale dump for the C++ TB: [S_box0..2, S_cls0..2] float32.
+    np.array([S_box["s0"], S_box["s1"], S_box["s2"],
+              S_cls["s0"], S_cls["s1"], S_cls["s2"]], np.float32).tofile(
+        os.path.join(STIM, "scales.f32"))
 
     print(f"\nWorst float-vs-ORT cos: {worst_float:.6f}  (≈1.0 ⇒ topology correct)")
     print("Worst int8-ref faithfulness:", {k: round(v,6) for k,v in worst.items()})
