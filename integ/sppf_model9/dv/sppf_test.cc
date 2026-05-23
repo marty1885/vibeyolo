@@ -264,9 +264,42 @@ static double load_s_in() {
     return std::stod(txt.substr(colon + 1, comma - colon - 1));
 }
 
+// Chain mode: stream an external int8 frame (CHAIN_IN, H*W*C) through the SPPF
+// RTL and dump the H*W*OUT_C int8 output to CHAIN_OUT, so tools/e2e/chain.py can
+// run the real SPPF IP in the end-to-end chain instead of a numpy model.
+static int chain_mode(SimCtrl<Vsppf_tb>& sim, const char* in_path,
+                      const char* out_path) {
+    auto input = load_i8_hex(in_path, size_t(H) * W * C);
+    sim.reset();
+    sim.dut->start_i = 0; sim.dut->ivalid_i = 0; sim.dut->oready_i = 0;
+    int8_t zero[C]; std::memset(zero, 0, sizeof(zero));
+    pack_in(sim.dut.get(), zero); sim.tick();
+    sim.dut->start_i = 1; sim.tick(); sim.dut->start_i = 0;
+    const int total = H * W;
+    std::vector<int8_t> out(size_t(total) * OUT_C, 0);
+    int in_idx = 0, out_idx = 0; int8_t buf[OUT_C];
+    while (out_idx < total) {
+        if (in_idx < total) { sim.dut->ivalid_i = 1; pack_in(sim.dut.get(), &input[in_idx * C]); }
+        else { sim.dut->ivalid_i = 0; pack_in(sim.dut.get(), zero); }
+        sim.dut->oready_i = 1; sim.dut->eval();
+        bool i_fire = sim.dut->ivalid_i && sim.dut->iready_o;
+        bool o_fire = sim.dut->ovalid_o && sim.dut->oready_i;
+        if (o_fire) { unpack_out(sim.dut.get(), buf);
+            std::memcpy(&out[size_t(out_idx) * OUT_C], buf, OUT_C); out_idx++; }
+        sim.tick(); if (i_fire) in_idx++;
+    }
+    FILE* f = fopen(out_path, "w");
+    for (auto b : out) fprintf(f, "%02x\n", (unsigned)(uint8_t)b);
+    fclose(f);
+    printf("sppf chain: %d in, %d out -> %s\n", in_idx, out_idx, out_path);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     SimCtrl<Vsppf_tb> sim(argc, argv);
     sim.max_time = 2'000'000'000ull;
+    if (const char* ci = getenv("CHAIN_IN"))
+        return chain_mode(sim, ci, getenv("CHAIN_OUT"));
 
     printf("sppf test (H=%d W=%d C=%d K=%d ROI=%dx%d)\n",
            H, W, C, K, ROI_H, ROI_W);

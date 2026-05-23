@@ -247,9 +247,48 @@ static double load_s_out_for(const std::string& name) {
     return std::stod(txt.substr(colon + 1, comma - colon - 1));
 }
 
+// Chain mode (see model.11 copy): external A/B int8 frames -> real
+// upsample_concat IP -> C_O int8 frame for tools/e2e/chain.py.
+static int chain_mode(SimCtrl<Vupsample_concat_tb>& sim, const char* ap,
+                      const char* bp, const char* op) {
+    auto a_in = load_i8_hex(ap, size_t(H_A) * W_A * C_A);
+    auto b_in = load_i8_hex(bp, size_t(H_B) * W_B * C_B);
+    sim.reset();
+    sim.dut->start_i = 0; sim.dut->avalid_i = 0; sim.dut->bvalid_i = 0;
+    sim.dut->oready_i = 0;
+    int8_t za[C_A]; std::memset(za, 0, sizeof(za));
+    int8_t zb[C_B]; std::memset(zb, 0, sizeof(zb));
+    pack_lanes(&sim.dut->adata_i, za, C_A); pack_lanes(&sim.dut->bdata_i, zb, C_B);
+    sim.tick();
+    sim.dut->start_i = 1; sim.tick(); sim.dut->start_i = 0;
+    const int ta = H_A * W_A, tb = H_B * W_B, to = H_O * W_O;
+    std::vector<int8_t> out(size_t(to) * C_O, 0);
+    int ai = 0, bi = 0, oi = 0; int8_t buf[C_O];
+    while (oi < to) {
+        if (ai < ta) { sim.dut->avalid_i = 1; pack_lanes(&sim.dut->adata_i, &a_in[ai * C_A], C_A); }
+        else { sim.dut->avalid_i = 0; pack_lanes(&sim.dut->adata_i, za, C_A); }
+        if (bi < tb) { sim.dut->bvalid_i = 1; pack_lanes(&sim.dut->bdata_i, &b_in[bi * C_B], C_B); }
+        else { sim.dut->bvalid_i = 0; pack_lanes(&sim.dut->bdata_i, zb, C_B); }
+        sim.dut->oready_i = 1; sim.dut->eval();
+        bool af = sim.dut->avalid_i && sim.dut->aready_o;
+        bool bf = sim.dut->bvalid_i && sim.dut->bready_o;
+        bool of = sim.dut->ovalid_o && sim.dut->oready_i;
+        if (of) { unpack_lanes(&sim.dut->odata_o, buf, C_O);
+            std::memcpy(&out[size_t(oi) * C_O], buf, C_O); oi++; }
+        sim.tick(); if (af) ai++; if (bf) bi++;
+    }
+    FILE* f = fopen(op, "w");
+    for (auto b : out) fprintf(f, "%02x\n", (unsigned)(uint8_t)b);
+    fclose(f);
+    printf("upsample chain: a=%d b=%d o=%d -> %s\n", ai, bi, oi, op);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     SimCtrl<Vupsample_concat_tb> sim(argc, argv);
     sim.max_time = 4'000'000'000ull;
+    if (const char* ca = getenv("CHAIN_IN_A"))
+        return chain_mode(sim, ca, getenv("CHAIN_IN_B"), getenv("CHAIN_OUT"));
 
     printf("upsample_concat (model.14/15) test (A=%dx%dx%d  B=%dx%dx%d  O=%dx%dx%d)\n",
            C_A, H_A, W_A, C_B, H_B, W_B, C_O, H_O, W_O);

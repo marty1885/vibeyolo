@@ -100,7 +100,82 @@ static void set_cls(DUT* d, const int8_t* c){
   uint8_t* r=reinterpret_cast<uint8_t*>(&d->cls_i); for(int i=0;i<N_CLS;i++) r[i]=(uint8_t)c[i];
 }
 
+// ── chain mode ──
+// Driven by tools/e2e/chain.py to run the REAL detect-head IP inside the
+// end-to-end "chip" chain on a live image (not the canned stim). Reads the six
+// int8 conv-tail streams + six fp16 scales from explicit paths, drives one
+// frame, and dumps the gathered top-K detections (anchor + fp16 box + fp16
+// logits) so chain.py can reassemble logits/pred_boxes. No goldens, no gating —
+// the chain compares end-to-end detections to ORT itself.
+//   env: CHAIN_BOX_S{0,1,2}, CHAIN_CLS_S{0,1,2}  (int8 [chan][spatial] .bin)
+//        CHAIN_SCALES (6 float32: s_box0..2, s_cls0..2)   CHAIN_OUT (out .bin)
+//   out: K records, each uint16[1+4+N_CLS] = anchor, box[4]fp16, logits[80]fp16
+static int chain_mode(int argc, char** argv){
+  SimCtrl<DUT> sim(argc, argv);
+  sim.max_time = 40000000ull;
+
+  std::vector<float> sc = load<float>(std::string(getenv("CHAIN_SCALES")));
+  uint16_t sbox[3], scls[3];
+  for(int i=0;i<3;i++){ sbox[i]=d2f(sc[i]); scls[i]=d2f(sc[3+i]); }
+  const char* fbox[3]={getenv("CHAIN_BOX_S0"),getenv("CHAIN_BOX_S1"),getenv("CHAIN_BOX_S2")};
+  const char* fcls[3]={getenv("CHAIN_CLS_S0"),getenv("CHAIN_CLS_S1"),getenv("CHAIN_CLS_S2")};
+
+  std::vector<std::vector<int8_t>> boxA(N_ANCHOR, std::vector<int8_t>(4));
+  std::vector<std::vector<int8_t>> clsA(N_ANCHOR, std::vector<int8_t>(N_CLS));
+  int off=0;
+  for(int si=0; si<3; si++){
+    auto bx=load<int8_t>(std::string(fbox[si]));  // [4][n]
+    auto cl=load<int8_t>(std::string(fcls[si]));   // [80][n]
+    int n=SCNT[si];
+    for(int p=0;p<n;p++){
+      for(int c=0;c<4;c++)     boxA[off+p][c]=bx[c*n+p];
+      for(int c=0;c<N_CLS;c++) clsA[off+p][c]=cl[c*n+p];
+    }
+    off+=n;
+  }
+
+  sim.dut->rst_ni=0; sim.dut->start_i=0; sim.dut->in_valid_i=0;
+  sim.dut->s_box0_i=sbox[0]; sim.dut->s_box1_i=sbox[1]; sim.dut->s_box2_i=sbox[2];
+  sim.dut->s_cls0_i=scls[0]; sim.dut->s_cls1_i=scls[1]; sim.dut->s_cls2_i=scls[2];
+  sim.reset();
+  sim.dut->start_i=1; sim.tick(); sim.dut->start_i=0;
+
+  int fed=0; long guard=0;
+  std::vector<uint16_t> oa; std::vector<std::array<uint16_t,4>> ob;
+  std::vector<std::vector<uint16_t>> ol;
+  while(true){
+    if(sim.dut->in_ready_o && fed<N_ANCHOR){
+      set_box(sim.dut.get(), boxA[fed].data());
+      set_cls(sim.dut.get(), clsA[fed].data());
+      sim.dut->in_valid_i=1;
+    } else sim.dut->in_valid_i=0;
+    if(sim.dut->out_valid_o){
+      oa.push_back((uint16_t)sim.dut->out_anchor_o);
+      std::array<uint16_t,4> bx; uint16_t* br=reinterpret_cast<uint16_t*>(&sim.dut->out_box_o);
+      for(int c=0;c<4;c++) bx[c]=br[c]; ob.push_back(bx);
+      std::vector<uint16_t> lg(N_CLS); uint16_t* lr=reinterpret_cast<uint16_t*>(&sim.dut->out_logits_o);
+      for(int c=0;c<N_CLS;c++) lg[c]=lr[c]; ol.push_back(lg);
+    }
+    bool done = sim.dut->done_o;
+    if(sim.dut->in_ready_o && fed<N_ANCHOR) fed++;
+    sim.tick();
+    if(done) break;
+    if(++guard > 2000000){ fprintf(stderr,"chain detect TIMEOUT fed=%d outs=%zu\n",fed,oa.size()); break; }
+  }
+  int n_out=(int)oa.size();
+  FILE* f=fopen(getenv("CHAIN_OUT"),"wb");
+  for(int i=0;i<n_out;i++){
+    fwrite(&oa[i],2,1,f);
+    fwrite(ob[i].data(),2,4,f);
+    fwrite(ol[i].data(),2,N_CLS,f);
+  }
+  fclose(f);
+  fprintf(stderr,"chain detect: %d outputs -> %s\n", n_out, getenv("CHAIN_OUT"));
+  return 0;
+}
+
 int main(int argc, char** argv){
+  if(getenv("CHAIN_OUT")) return chain_mode(argc, argv);
   SimCtrl<DUT> sim(argc, argv);
   sim.max_time = 40000000ull;  // 6 frames x ~85k cyc topk-bound, with margin
 
