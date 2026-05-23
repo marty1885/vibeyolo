@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibeyolo — YOLO26n Inference ASIC — Status</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 1040px; margin: 2em auto; padding: 0 1.5em; color: #1a1a1a; line-height: 1.55; }
+  h1 { border-bottom: 3px solid #222; padding-bottom: .3em; margin-top: 0; }
+  h2 { border-bottom: 1px solid #ccc; padding-bottom: .2em; margin-top: 2em; }
+  h3 { margin-top: 1.5em; }
+  .meta { color: #555; font-size: .9em; margin-bottom: 1em; }
+  .summary { background: #f4f7fb; border-left: 4px solid #2c5b9b; padding: .8em 1em; margin: 1em 0; }
+  .ok { color: #1e7a36; font-weight: 600; }
+  .warn { color: #a86a00; font-weight: 600; }
+  .todo { color: #888; }
+  table { border-collapse: collapse; width: 100%; margin: .8em 0 1.4em; font-size: .94em; }
+  th, td { border: 1px solid #ccc; padding: .35em .55em; text-align: left; vertical-align: top; }
+  th { background: #eef1f5; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  pre { background: #f6f8fa; padding: .8em 1em; border-radius: 4px; overflow-x: auto; font-size: .88em; }
+  code { background: #f0f2f5; padding: 1px 5px; border-radius: 3px; font-size: .92em; }
+  .progress-bar { background: #e3e7ed; border-radius: 6px; overflow: hidden; height: 22px; margin: .3em 0; }
+  .progress-bar > div { background: linear-gradient(90deg,#3da25b,#5cc77d); height: 100%; color: white;
+                         font-size: .82em; text-align: right; padding-right: .6em; line-height: 22px; font-weight: 600; }
+  .footnote { font-size: .85em; color: #666; }
+  figure { margin: 1.2em 0; }
+  figure svg { width: 100%; height: auto; border: 1px solid #e2e6ec; border-radius: 8px; background: #fff; }
+  figcaption { font-size: .85em; color: #555; margin-top: .5em; }
+  /* SVG node styles */
+  .n { rx: 7; ry: 7; stroke-width: 1; }
+  .lbl  { font: 600 12px ui-monospace, monospace; fill: #fff; }
+  .lbl2 { font: 11px ui-monospace, monospace; fill: #e8eef7; }
+  .blk  { font: 11px -apple-system, sans-serif; fill: #333; }
+  .dim  { font: 10px ui-monospace, monospace; fill: #555; }
+</style>
+</head>
+<body>
+
+<h1>vibeyolo — YOLO26n Inference ASIC</h1>
+<div class="meta">Half-reticle N16 fixed-function accelerator · Status as of 2026-05-24</div>
+
+<div class="summary">
+<strong>One-line status:</strong> All 102 conv layers ORT-validated, all six integration blocks
+(SPPF · 2× upsample · 2× attention · detect head) DV-passing, and the per-layer streaming
+datapath <code>conv_stage</code> is DV bit-exact. <strong>Throughput signed off at 11,806 FPS @ 1 GHz</strong>
+(II = 84,700 cyc, 0/102 stages over budget). The structural top-level netlist composes all 102
+conv stages <em>plus all glue, blocks and skip-FIFOs</em> and lints clean. The full chip is
+validated end-to-end on a real image (bus.jpg) via a layer-by-layer RTL chain — same 5 detections
+as ORT. <strong>Attention is now a real <code>flash_attn</code> datapath</strong> (it had been a
+shim that discarded the attention result; fixed 2026-05-24). Remaining for tape-out: swap the
+generated core body into the frozen <code>yolo26n_top</code> boundary, then scale verification to a
+large image set.
+</div>
+
+<h2>1. Project Goal</h2>
+<p>
+Build a single-purpose, pipelined, feed-forward ASIC that runs <strong>YOLO26n int8 inference</strong>
+end-to-end at "bonkers throughput." Each layer of the network gets its own dedicated dataflow
+silicon — no shared MAC array, no instruction fetch, no programmability.
+</p>
+
+<table>
+<tr><th>Parameter</th><th>Target</th><th>Status</th></tr>
+<tr><td>Process</td><td>TSMC N16</td><td>—</td></tr>
+<tr><td>Reticle</td><td>Half-reticle (~430 mm²)</td><td>area proxy 22,096 — comfortable</td></tr>
+<tr><td>Frame budget <code>T_FRAME</code></td><td>100,000 cycles/frame</td><td class="ok">met — worst stage 84,700</td></tr>
+<tr><td>Throughput</td><td>~10,000 FPS @ 1 GHz</td><td class="ok">11,806 FPS</td></tr>
+<tr><td>Workload</td><td>YOLO26n, 640×640 input, int8 quantized</td><td>—</td></tr>
+<tr><td>Gate budget</td><td>~6.5 G gates (area not the binding constraint)</td><td>~25K MAC units</td></tr>
+</table>
+
+<p><strong>Priority order:</strong> correctness &gt; speed &gt; codebase generality. Area is tunable —
+the per-layer generator re-balances <code>P_PIX</code>/<code>P_COUT</code>/<code>P_CIN</code> against
+a configurable <code>T_FRAME</code> target if we go over area or IO budget.</p>
+
+<h2>2. Architecture at a glance</h2>
+
+<p>
+The chip is a <strong>spatial pipeline</strong>: every op in the YOLO26n graph — convolution,
+residual add, concat, upsample, attention, detect head — is its own dedicated block, all resident
+on-die at once. Activations stream block-to-block; skip connections are buffered in on-die SRAM
+FIFOs. There is no instruction memory, no scheduler, no shared compute fabric.
+</p>
+
+<figure>
+<!-- ============ TOP-LEVEL DATAFLOW (backbone → FPN/PAN neck → detect head) ============ -->
+<svg viewBox="0 0 1000 560" role="img" aria-label="YOLO26n top-level dataflow">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#566"/>
+    </marker>
+    <marker id="arrG" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#b8860b"/>
+    </marker>
+  </defs>
+
+  <!-- resolution bands -->
+  <rect x="150" y="60"  width="690" height="86"  fill="#eef6ff"/>
+  <rect x="150" y="206" width="690" height="86"  fill="#e7effb"/>
+  <rect x="150" y="352" width="690" height="96"  fill="#e0e9f8"/>
+  <text x="158" y="78"  class="dim">P3 · 80×80</text>
+  <text x="158" y="224" class="dim">P4 · 40×40</text>
+  <text x="158" y="370" class="dim">P5 · 20×20</text>
+
+  <!-- ============ BACKBONE (spans all resolutions) ============ -->
+  <rect class="n" x="20" y="60" width="116" height="388" fill="#21477a" stroke="#15315a"/>
+  <text x="78" y="84"  text-anchor="middle" class="lbl">BACKBONE</text>
+  <text x="78" y="104" text-anchor="middle" class="lbl2">L0–L1 stem</text>
+  <text x="78" y="120" text-anchor="middle" class="lbl2">m.2 C2f</text>
+  <text x="78" y="142" text-anchor="middle" class="lbl2">m.4 C2f →P3</text>
+  <text x="78" y="206" text-anchor="middle" class="lbl2">m.6 C2f →P4</text>
+  <text x="78" y="300" text-anchor="middle" class="lbl2">m.8 C2f</text>
+  <text x="78" y="372" text-anchor="middle" class="lbl2">m.9 SPPF</text>
+  <text x="78" y="392" text-anchor="middle" class="lbl2">+resid(m.8)</text>
+  <text x="78" y="414" text-anchor="middle" class="lbl2">m.10 PSA</text>
+  <text x="78" y="430" text-anchor="middle" class="lbl2">attn →P5</text>
+  <text x="78" y="56" text-anchor="middle" class="dim">img 640²×3 ▸</text>
+
+  <!-- backbone taps -->
+  <line x1="136" y1="103" x2="298" y2="103" stroke="#b8860b" stroke-width="2" marker-end="url(#arrG)"/>
+  <rect x="194" y="92" width="78" height="22" rx="4" fill="#f4e2b0" stroke="#b8860b"/>
+  <text x="233" y="107" text-anchor="middle" class="dim">FIFO 819KB</text>
+
+  <line x1="136" y1="249" x2="298" y2="249" stroke="#b8860b" stroke-width="2" marker-end="url(#arrG)"/>
+  <rect x="196" y="238" width="74" height="22" rx="4" fill="#f4e2b0" stroke="#b8860b"/>
+  <text x="233" y="253" text-anchor="middle" class="dim">FIFO 205KB</text>
+
+  <line x1="136" y1="400" x2="455" y2="400" stroke="#b8860b" stroke-width="2" marker-end="url(#arrG)"/>
+  <rect x="196" y="389" width="74" height="22" rx="4" fill="#f4e2b0" stroke="#b8860b"/>
+  <text x="233" y="404" text-anchor="middle" class="dim">FIFO 102KB</text>
+
+  <!-- ============ FPN top-down ============ -->
+  <!-- m.13 (P4) -->
+  <rect class="n" x="300" y="222" width="116" height="50" fill="#3a6fb0" stroke="#234b7e"/>
+  <text x="358" y="242" text-anchor="middle" class="lbl">m.13 C2f</text>
+  <text x="358" y="259" text-anchor="middle" class="lbl2">↑2× ⊕ P4</text>
+  <!-- m.16 (P3) = head P3 -->
+  <rect class="n" x="300" y="76" width="116" height="50" fill="#3a6fb0" stroke="#234b7e"/>
+  <text x="358" y="96"  text-anchor="middle" class="lbl">m.16 C2f</text>
+  <text x="358" y="113" text-anchor="middle" class="lbl2">↑2× ⊕ P3</text>
+  <!-- P5 -> m.13 (up) -->
+  <path d="M300,395 C270,395 285,255 298,250" fill="none" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+  <!-- m.13 -> m.16 (up) -->
+  <line x1="358" y1="222" x2="358" y2="128" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- ============ PAN bottom-up ============ -->
+  <!-- m.19 (P4) = head P4 -->
+  <rect class="n" x="470" y="222" width="116" height="50" fill="#3a6fb0" stroke="#234b7e"/>
+  <text x="528" y="242" text-anchor="middle" class="lbl">m.19 C2f</text>
+  <text x="528" y="259" text-anchor="middle" class="lbl2">↓s2 ⊕ m.13</text>
+  <!-- m.22 (P5) = head P5 -->
+  <rect class="n" x="470" y="368" width="116" height="56" fill="#6f2c97" stroke="#4d1c6b"/>
+  <text x="528" y="390" text-anchor="middle" class="lbl">m.22 A2C2f</text>
+  <text x="528" y="407" text-anchor="middle" class="lbl2">attn ↓s2 ⊕P5</text>
+  <!-- m.16 -> m.19 (down) -->
+  <path d="M416,101 C445,101 455,225 468,247" fill="none" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+  <!-- m.13 -> m.19 (skip concat) -->
+  <line x1="416" y1="247" x2="468" y2="247" stroke="#b8860b" stroke-width="2" marker-end="url(#arrG)"/>
+  <!-- m.19 -> m.22 (down) -->
+  <line x1="528" y1="272" x2="528" y2="368" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- ============ DETECT HEAD ============ -->
+  <rect class="n" x="650" y="76" width="190" height="372" fill="#a51f86" stroke="#74155f"/>
+  <text x="745" y="100" text-anchor="middle" class="lbl">DETECT HEAD · m.23</text>
+  <text x="745" y="120" text-anchor="middle" class="lbl2">(end-to-end, no NMS)</text>
+  <text x="745" y="150" text-anchor="middle" class="lbl2">per-anchor cv2 (box) +</text>
+  <text x="745" y="166" text-anchor="middle" class="lbl2">cv3 (cls) · 3 scales</text>
+  <text x="745" y="196" text-anchor="middle" class="lbl2">box_affine → boxes</text>
+  <text x="745" y="212" text-anchor="middle" class="lbl2">reduce_max → score</text>
+  <text x="745" y="240" text-anchor="middle" class="lbl2">TopK 300 / 8400</text>
+  <text x="745" y="256" text-anchor="middle" class="lbl2">gather (dequant_n)</text>
+  <text x="745" y="300" text-anchor="middle" class="lbl2">8400 anchors:</text>
+  <text x="745" y="316" text-anchor="middle" class="lbl2">80²+40²+20²</text>
+  <!-- head inputs -->
+  <line x1="416" y1="101" x2="648" y2="101" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="540" y="94" text-anchor="middle" class="dim">P3 head 80²×64</text>
+  <line x1="586" y1="247" x2="648" y2="247" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="616" y="240" text-anchor="middle" class="dim">P4 128</text>
+  <path d="M586,396 C620,396 636,360 646,316" fill="none" stroke="#566" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="612" y="392" text-anchor="middle" class="dim">P5 256</text>
+  <!-- head output -->
+  <line x1="840" y1="262" x2="930" y2="262" stroke="#566" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="930" y="250" text-anchor="end" class="dim">logits 300×80</text>
+  <text x="930" y="278" text-anchor="end" class="dim">boxes  300×4</text>
+
+  <!-- legend -->
+  <g transform="translate(20,470)">
+    <rect x="0"   y="0" width="14" height="14" rx="3" fill="#21477a"/><text x="20" y="11" class="blk">backbone</text>
+    <rect x="110" y="0" width="14" height="14" rx="3" fill="#3a6fb0"/><text x="130" y="11" class="blk">C2f neck block</text>
+    <rect x="255" y="0" width="14" height="14" rx="3" fill="#6f2c97"/><text x="275" y="11" class="blk">attention</text>
+    <rect x="360" y="0" width="14" height="14" rx="3" fill="#a51f86"/><text x="380" y="11" class="blk">detect head</text>
+    <rect x="480" y="0" width="14" height="14" rx="3" fill="#f4e2b0" stroke="#b8860b"/><text x="500" y="11" class="blk">skip SRAM FIFO</text>
+    <text x="640" y="11" class="blk">⊕ = concat / residual-add · ↑↓ = up/downsample</text>
+  </g>
+</svg>
+<figcaption>
+<strong>Figure 1 — Top-level dataflow.</strong> Backbone (left) extracts features at three
+resolutions (P3 80², P4 40², P5 20²). The FPN top-down path upsamples and fuses; the PAN
+bottom-up path downsamples and re-fuses. The detect head consumes the three fused feature maps and
+emits the top-300 detections directly (no NMS). Gold blocks are the on-die skip-connection SRAM
+FIFOs that hold early feature maps for the neck/head to consume later.
+</figcaption>
+</figure>
+
+<h2>3. Why a spatial pipeline (not a shared-MAC engine)</h2>
+
+<p>
+A common reaction to the YOLO26n op graph is: "most of the compute is sequential — convolution
+depends on convolution. Where's the parallelism, and aren't you just building a giant systolic
+array?" The answer is no: we exploit a kind of parallelism a shared-MAC / FSM design does not.
+</p>
+
+<table>
+<tr><th></th><th>FSM / shared-MAC (TPU-style systolic)</th><th>Spatial pipeline (this project)</th></tr>
+<tr><td>Compute fabric</td>
+    <td>One array of PEs, time-multiplexed across all layers</td>
+    <td>102 independently-sized conv blocks + dedicated blocks for every other op, all on-die at once</td></tr>
+<tr><td>Where parallelism lives</td>
+    <td>Intra-layer only</td>
+    <td>Intra-layer <em>and</em> inter-layer (every block runs simultaneously at steady state)</td></tr>
+<tr><td>Cycles per frame</td>
+    <td>Σ per-layer time on the shared array</td>
+    <td><strong>max</strong> per-layer time (the bottleneck stage sets the rate)</td></tr>
+<tr><td>Throughput @ 1 GHz</td>
+    <td>~10²–10³ FPS<br/><span class="footnote">(an FSM analysis of YOLO26n estimated ~1.8 M cyc/frame ≈ ~550 FPS)</span></td>
+    <td class="ok">~11,800 FPS (84.7K worst-stage cyc/frame)</td></tr>
+<tr><td>Reconfigurable</td>
+    <td>Yes — schedule a different model onto the same silicon</td>
+    <td>No — this chip runs YOLO26n and only YOLO26n</td></tr>
+</table>
+
+<p>
+The op graph <em>is</em> topologically sequential — but that only constrains <strong>latency</strong>,
+not <strong>throughput</strong>. Once the pipeline is full, every stage is busy every cycle, even
+though any given pixel still walks through the stages in order — the same trick a CPU pipeline uses
+to get IPC ≈ 1 from sequential code. At steady state the L0 stem is processing frame N+70 while the
+detect head finishes frame N: different silicon, working concurrently on different frames. Skip
+connections become on-die SRAM FIFOs; concat/add nodes become small mux / <code>add_rq</code>
+blocks wired between stages.
+</p>
+
+<h2>4. The conv_stage datapath (instantiated 102×)</h2>
+
+<p>
+Every convolutional layer is a parameterized instance of <code>conv_stage</code> — the
+synthesizable per-layer streaming wrapper. It turns a raster int8 activation stream into the next
+layer's stream, hiding the per-tile dataflow inside. Per-layer constants (channel counts, kernel,
+stride, parallelism, quantization scales) come from a generated package; weights/scale/bias live in
+on-die ROMs.
+</p>
+
+<figure>
+<!-- ============ conv_stage internal datapath ============ -->
+<svg viewBox="0 0 1000 280" role="img" aria-label="conv_stage datapath">
+  <defs>
+    <marker id="arr2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#566"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="120" class="dim">idata[CIN]</text>
+  <text x="20" y="134" class="dim">raster ▸</text>
+  <line x1="78" y1="120" x2="118" y2="120" stroke="#566" stroke-width="1.6" marker-end="url(#arr2)"/>
+
+  <!-- linebuf -->
+  <rect class="n" x="120" y="92" width="120" height="56" fill="#2c5b9b" stroke="#1c3d6b"/>
+  <text x="180" y="116" text-anchor="middle" class="lbl">linebuf_kxk</text>
+  <text x="180" y="133" text-anchor="middle" class="lbl2">K×K patch</text>
+  <text x="180" y="166" text-anchor="middle" class="dim">zero same-pad</text>
+  <text x="180" y="180" text-anchor="middle" class="dim">stride decimate</text>
+
+  <line x1="240" y1="120" x2="290" y2="120" stroke="#566" stroke-width="1.6" marker-end="url(#arr2)"/>
+  <text x="265" y="113" text-anchor="middle" class="dim">patch</text>
+
+  <!-- sequencer + ROMs -->
+  <rect class="n" x="292" y="78" width="150" height="118" fill="#1f8a8a" stroke="#136060"/>
+  <text x="367" y="100" text-anchor="middle" class="lbl">tile sequencer</text>
+  <text x="367" y="116" text-anchor="middle" class="lbl2">FSM</text>
+  <text x="367" y="138" text-anchor="middle" class="lbl2">out-pixel:</text>
+  <text x="367" y="153" text-anchor="middle" class="lbl2">outer cout-tile</text>
+  <text x="367" y="168" text-anchor="middle" class="lbl2">inner cin-tile</text>
+  <text x="367" y="188" text-anchor="middle" class="lbl2">first/last_cin</text>
+  <!-- ROMs feeding sequencer -->
+  <rect class="n" x="292" y="24" width="150" height="40" fill="#7a5c10" stroke="#564008"/>
+  <text x="367" y="40" text-anchor="middle" class="lbl">on-die ROMs ($readmemh)</text>
+  <text x="367" y="56" text-anchor="middle" class="lbl2">WROM · SROM · BROM</text>
+  <line x1="367" y1="64" x2="367" y2="76" stroke="#566" stroke-width="1.6" marker-end="url(#arr2)"/>
+
+  <line x1="442" y1="120" x2="492" y2="120" stroke="#566" stroke-width="1.6" marker-end="url(#arr2)"/>
+  <text x="467" y="113" text-anchor="middle" class="dim">x,w,scale,bias</text>
+
+  <!-- conv_layer compute -->
+  <rect class="n" x="494" y="62" width="200" height="150" fill="#2c5b9b" stroke="#1c3d6b"/>
+  <text x="594" y="84"  text-anchor="middle" class="lbl">conv_layer (verified)</text>
+  <text x="594" y="108" text-anchor="middle" class="lbl2">P_COUT × dotN(K²·P_CIN)</text>
+  <text x="594" y="128" text-anchor="middle" class="lbl2">↓ int32 accum</text>
+  <text x="594" y="148" text-anchor="middle" class="lbl2">requant: i32→fp16</text>
+  <text x="594" y="164" text-anchor="middle" class="lbl2">→ fma(scale,bias)→ i8</text>
+  <text x="594" y="184" text-anchor="middle" class="lbl2">↓ (opt) SiLU LUT</text>
+  <text x="594" y="200" text-anchor="middle" class="lbl2">cout_tile_idx tag</text>
+
+  <line x1="694" y1="137" x2="744" y2="137" stroke="#566" stroke-width="1.6" marker-end="url(#arr2)"/>
+
+  <!-- reassemble -->
+  <rect class="n" x="746" y="110" width="120" height="56" fill="#3a6fb0" stroke="#234b7e"/>
+  <text x="806" y="132" text-anchor="middle" class="lbl">reassemble</text>
+  <text x="806" y="149" text-anchor="middle" class="lbl2">COUT pixel</text>
+
+  <line x1="866" y1="137" x2="916" y2="137" stroke="#566" stroke-width="1.6" marker-end="url(#arr2)"/>
+  <text x="958" y="133" text-anchor="middle" class="dim">odata[COUT]</text>
+  <text x="958" y="147" text-anchor="middle" class="dim">▸ raster</text>
+
+  <text x="500" y="245" class="blk" font-style="italic">DV: dual-instance bit-exact vs conv_layer — 5/5 configs (k1, k3, stride-2, partial tiles, no-SiLU)</text>
+</svg>
+<figcaption>
+<strong>Figure 2 — <code>conv_stage</code> datapath.</strong> The line buffer forms K×K patches
+(with stride decimation); the tile sequencer FSM replays each output pixel as an outer cout-tile /
+inner cin-tile beat schedule, feeding the verified <code>conv_layer</code> compute core from on-die
+weight/scale/bias ROMs; outputs are reassembled into the COUT-wide pixel stream. Validated
+bit-exact against <code>conv_layer</code> driven by the original (ORT-validated) software tile
+schedule.
+</figcaption>
+</figure>
+
+<p>Per-pixel cycles = <code>(COUT / P_COUT) × (CIN / P_CIN)</code>; the generator balances these
+factors per layer to fit the global frame budget. The numerical scheme:</p>
+<pre>out_i8 = sat_i8( round( fp16(acc_i32) × scale_fp16 + bias_fp16 ) )    [+ optional SiLU LUT, + optional residual add_rq]</pre>
+
+<h2>5. Build status</h2>
+
+<h3>Conv layer verification (102 layers)</h3>
+<div class="progress-bar"><div style="width: 100%;">102 / 102 ORT-validated (100%)</div></div>
+<p>Full regression sweep ~1m 47s wall on a 32-core box, all layers cosine ≥ 0.998 vs ORT.
+Generator handles ordinary Conv+SiLU, no-activation tails, residual+SiLU, depthwise
+(group=cin=cout), residual+no-SiLU, and dynamic per-layer <code>S_OUT</code> sizing.</p>
+
+<h3>Blocks &amp; integration</h3>
+<table>
+<tr><th>Component</th><th>Status</th></tr>
+<tr><td>18 leaf IPs (MAC, FP16 path, requant, SiLU/sigmoid, softmax, line buffer, …)</td><td class="ok">All DV-passing</td></tr>
+<tr><td><code>conv_layer</code> tiled compute core</td><td class="ok">DV-passing, validated across 102 instantiations</td></tr>
+<tr><td><code>conv_stage</code> — synthesizable per-layer streaming wrapper</td><td class="ok">DV bit-exact vs conv_layer (5 configs)</td></tr>
+<tr><td>SPPF block (model.9, between L31/L32)</td><td class="ok">10/10 checks, cos ≥ 0.99994</td></tr>
+<tr><td>Upsample blocks (P4→P3, P3→detect)</td><td class="ok">5/5 samples bit-exact, cos 0.9995–0.9998</td></tr>
+<tr><td>Attention blocks (PSA model.10, A2C2f model.22) — real <code>flash_attn</code> datapath</td><td class="ok">Both 5/5, cos ≥ 0.9996 vs ORT on ATTN_OUT (head0 1.0, head1 0.9998); <code>flash_attn</code> prod 71,701 cyc &lt; 100k. <span class="footnote">Was a residual-only shim (flash_attn discarded via keep-alive XOR); rewritten to qkv,pe → flash_attn → +pe → ATTN_OUT on 2026-05-24.</span></td></tr>
+<tr><td>Detect head with learned top-k (end-to-end, no NMS)</td><td class="ok">7/7 DV; new leaves reduce_max_n / box_affine / dequant_n</td></tr>
+<tr><td><code>yolo26n_top</code> frozen chip boundary (AXI-S + AXI-Lite + DFT)</td><td class="ok">Lint-clean, PD handoff ready</td></tr>
+<tr><td>Throughput / latency sign-off (<code>TIMING.md</code>)</td><td class="ok">11,806 FPS, 0 misses</td></tr>
+<tr><td>Structural <code>yolo26n_core_impl</code> — 102 conv_stage + glue + 6 blocks + skips composed</td><td class="ok">Lint-clean, full design (0 warn / 0 err)</td></tr>
+<tr><td>Inter-stage glue / block / skip-FIFO wiring in core (<code>gen_core.py</code>)</td><td class="ok">Done — C2f slice/concat + residual <code>add_rq</code> banks, 6 blocks at graph positions, 4 skip-FIFO banks; attention region rewired to 2-in ATTN_OUT + real residual adds</td></tr>
+<tr><td>End-to-end 640×640 image vs ORT (layer-by-layer RTL chain)</td><td class="ok">Same 5 detections as ORT (bus + 4 people, IoU 0.93–0.98); logits cos 0.98. All 6 block types on real RTL</td></tr>
+<tr><td>Generated core swapped into frozen <code>yolo26n_top</code> body</td><td class="warn">Pending — top still instantiates the skeletal placeholder core</td></tr>
+</table>
+
+<h2>6. Performance &amp; timing sign-off</h2>
+<p>From <code>tools/throughput.py</code> → <code>TIMING.md</code>. The chip is a frame-level pipelined
+dataflow (per-stage double-buffered), so <strong>throughput = the slowest single stage</strong> and
+latency = the critical-path pipeline fill.</p>
+<table>
+<tr><th>Metric</th><th>Value</th><th>Spec</th><th></th></tr>
+<tr><td>Throughput (II = slowest stage)</td><td class="num">84,700 cyc</td><td>≤ 100,000</td><td class="ok">PASS</td></tr>
+<tr><td>Frames/sec @ 1 GHz</td><td class="num">11,806 FPS</td><td>≥ 10,000</td><td class="ok">PASS</td></tr>
+<tr><td>Bottleneck stage</td><td colspan="3">detect head (decode + TopK-300 + gather)</td></tr>
+<tr><td>Conv stages over <code>T_FRAME</code></td><td class="num">0 / 102</td><td>0</td><td class="ok">PASS</td></tr>
+<tr><td>Worst conv stage</td><td class="num">80,000 cyc</td><td colspan="2">balanced production config</td></tr>
+<tr><td>Single-frame latency (pipeline fill)</td><td class="num">~5.94 M cyc ≈ 5.94 ms</td><td colspan="2">~70 frames in flight</td></tr>
+<tr><td>Total MAC units (full unroll)</td><td class="num">~25,261</td><td colspan="2">area proxy 22,096</td></tr>
+</table>
+<p class="footnote">
+Numbers are from the static per-layer schedule (balanced production scale package) plus measured
+block DV cycle counts. Real silicon timing and SRAM bandwidth are not yet modeled. Without
+per-stage double-buffering (one frame in flight) throughput would drop to ~168 FPS — the design
+assumes double-buffering, consistent with the "worst-stage sets the rate" model.
+</p>
+
+<h2>7. What's left</h2>
+<p class="footnote">Done since the last revision: top-level glue/block/skip wiring (<code>gen_core.py</code>
+composes the full netlist, lints clean); end-to-end real-image validation via the RTL chain; and the
+attention block, which had been a shim that discarded <code>flash_attn</code>'s output, is now a real
+attention datapath.</p>
+<ol>
+<li><strong>Swap the generated core into the frozen boundary</strong>: <code>yolo26n_top</code> still
+    instantiates the skeletal placeholder <code>yolo26n_core</code> (drains pixels, emits zeros) so PD
+    has a stable boundary to floorplan. Replace its body with the generated
+    <code>yolo26n_core_impl</code> dataflow netlist (or reconcile the two), keeping ports frozen.</li>
+<li><strong>Scale verification to a large image set</strong>: the layer-by-layer RTL chain
+    (<code>tools/e2e/chain.py</code>) proves the chip on one image (all blocks on real RTL); run it over
+    many real images and gate on detection agreement (IoU + class), not raw cosine. A single monolithic
+    Verilator elaboration of all 102 layers remains infeasible, so this stays a block-chained flow.</li>
+<li><strong>Real silicon timing / SRAM bandwidth</strong>: the 11,806 FPS sign-off assumes "magical
+    SRAM" and per-stage double-buffering; real IO and skip-FIFO bandwidth are not yet modeled.</li>
+</ol>
+
+<h2>8. Risks &amp; open questions</h2>
+<ul>
+<li><strong>Skip-FIFO SRAM bandwidth:</strong> P3/P4/P5 skip buffers must absorb burst writes from
+    the backbone and feed slower reads to the neck/head. Sizing is set by the static schedule;
+    bandwidth is assumed adequate but not yet measured.</li>
+<li><strong>External activation IO:</strong> the current model assumes "magical SRAM" — streams in
+    and out without contention. Real IO bandwidth may force <code>T_FRAME</code> down (the per-layer
+    <code>P_PIX/P_COUT/P_CIN</code> knobs re-balance at a slacker budget).</li>
+<li><strong>Whole-chip verification:</strong> all 102 layers in one Verilator design is infeasible
+    (lint of the conv backbone alone is ~80 s / ~8 GB). End-to-end validation must be a
+    block-chained C++/golden flow, not a monolithic elaboration.</li>
+<li><strong>Detect-head on real images:</strong> end-to-end vs ORT is meaningful only on real
+    images with separated detections — on object-free synthetic input the TopK boundary churns and
+    cosine collapses even when the hardware is correct (gated instead on an int8 reference).</li>
+</ul>
+
+</body>
+</html>
