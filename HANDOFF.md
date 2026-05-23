@@ -102,13 +102,12 @@ All 102 conv layers are ORT-validated. The remaining work is block-level integra
 - [~] **Attention block — `/model.10` PSA** (`integ/attn_model10/`) — **behavioral placeholder, not synthesizable.** Numerics validated end-to-end against ORT (10/10 checks, 5/5 samples, cos 0.99972..0.99984), but the matmuls + 400-lane softmax are implemented in SV `real` arithmetic inside `always_ff`. Useful as a golden reference; do NOT count toward PD area/cycle modeling. Will be replaced by a thin shim around the new `hw/ip/flash_attn/` leaf IP once that lands.
 
 **Done since last handoff:**
-- [~] **`hw/ip/flash_attn/` — flash-attention leaf IP (WIP, over budget)** — parameterized tile-streaming fp16 flash-attention with online softmax; algorithm + golden + DV scaffolding correct. 5/5 DV checks pass at small shapes (HEADS=1, N=8, DIM_Q=4, DIM_V=4); worst cos(dut, shadow)=0.999976. **BR=1 BC=1 → ~2M cyc/frame at YOLO26n shapes = 20× over T_FRAME=100k.** Parallelization push is the next-up task — boundary, golden, and DV are parametric and stay as-is. Resolved: `pe` lives outside the IP (integration shim adds pe(V) post-IP).
+- [x] **`hw/ip/flash_attn/` — flash-attention leaf IP** — parameterized tile-streaming fp16 flash-attention with online softmax. **DV passes at all 5 configs** (small/dbg/mid1/mid2/prod). Production-shape (HEADS=2, N=400, DIM_Q=32, DIM_V=64, BR=16, BC=32, ~512 FMA cells): **71,701 cyc/frame — under T_FRAME=100k budget**. Bug found and fixed during multi-config DV bring-up: `S_NORM_S` non-final branch incremented `norm_chunk_q` but didn't reassign `state_q <= S_NORM_D`, so when `DIM_V > BC` (multi-chunk normalize) every chunk past the first sampled stale `cell_y` and corrupted `O_out`. One-line fix at `rtl/flash_attn.sv:753`. The original WIP "20× over budget" framing was the unparallelized `BR=1, BC=1` number — at the production tile sizes the design fits with room to spare. Resolved: `pe` lives outside the IP (integration shim adds pe(V) post-IP).
 
 **To build (in recommended order):**
-1. **`flash_attn` parallelization push** *(top priority)* — unroll BR/BC to hit T_FRAME=100k at YOLO26n shapes (target P_FMA ~512 → ~60k cyc/pass). Boundary/golden/DV are parametric and stay as-is; re-validate existing small-shape tests AND add a production-shape test.
-2. **Attention integration shim — `/model.10` PSA** *(small, after flash_attn hits budget)* — replaces behavioral `integ/attn_model10/` with ~80-line shim instantiating `flash_attn` + an external pe(V) `conv_layer` + `add_rq` residuals + requant boundaries. Re-run existing extract.py / TB against ORT.
-3. **Attention integration shim — `/model.22` A2C2f** *(trivial)* — parametric clone of `/model.10` shim. L88..L92 = L34..L38 shape-wise.
-4. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
+1. **Attention integration shim — `/model.10` PSA** *(next up — top priority)* — replaces behavioral `integ/attn_model10/` with ~80-line shim instantiating `flash_attn` + an external pe(V) `conv_layer` + `add_rq` residuals + requant boundaries. Re-run existing extract.py / TB against ORT.
+2. **Attention integration shim — `/model.22` A2C2f** *(trivial)* — parametric clone of `/model.10` shim. L88..L92 = L34..L38 shape-wise.
+3. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
 
 ### Top-level integration (after all blocks)
 - `top.sv` that wires all 102+ layer instances in a streaming dataflow.
@@ -290,10 +289,9 @@ for n in m.graph.node:
 
 ## What I'd do next (concrete plan for the new AI)
 
-1. Add residual/add support to `tools/layergen`, using L26 (`/model.8/m.0/m/m.0/cv2`) as the pilot.
-2. Generate/validate L26-L30. L26 and L28 need residual/add handling; L27/L29/L30 should be ordinary Conv+SiLU once their inputs are identified.
-3. Continue conv layers in generated waves, but stop at graph-boundary ops to add explicit support for concat, SPPF maxpool integration, upsample integration, attention, and detect head.
-4. Build attention block IPs for A2C2f/PSA in deeper neck.
-5. Top-level integration + E2E ORT validation on real images.
+1. **`/model.10` PSA attention integration shim** — wrap `hw/ip/flash_attn/` in a thin (~80 line) shim that does QKV split off L34's output, drives flash_attn, adds pe(V) via an external `conv_layer`, applies `add_rq` residuals around the proj/FFN convs, and handles requant boundaries. Replaces the behavioral `integ/attn_model10/`. Re-run its extract.py / TB against ORT.
+2. **`/model.22` A2C2f attention shim** — parametric clone of (1). L88..L92 shapes are byte-identical to L34..L38 per ONNX.
+3. **Detect head with learned top-k** — end-to-end, no NMS. Inspect `/model.23` in ONNX first; the novel piece is the cross-scale (80²/40²/20²) learned top-k.
+4. **Top-level integration + E2E ORT validation** on real 640×640 images.
 
 The hardest remaining technical risk is the **detect head** (end-to-end, learned top-k, no NMS). Look at the ONNX for `/model.23` and below before designing it.

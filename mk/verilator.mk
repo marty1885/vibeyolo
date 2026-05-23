@@ -29,7 +29,10 @@
 
 REPO_ROOT ?= $(shell git rev-parse --show-toplevel)
 VERILATOR ?= verilator
-VERILATOR_JOBS ?= $(shell procs=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1); jobs=$$((procs * 4 / 5)); if [ $$jobs -lt 1 ]; then jobs=1; fi; echo $$jobs)
+## VERILATOR_JOBS — capped at 16 to keep g++ RAM use sane (each instance can
+## hit ~3 GB on big Verilated designs).  Override on the command line for
+## smaller boxes, e.g. `VERILATOR_JOBS=4 make test`.
+VERILATOR_JOBS ?= $(shell procs=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1); jobs=$$((procs * 4 / 5)); if [ $$jobs -lt 1 ]; then jobs=1; fi; if [ $$jobs -gt 16 ]; then jobs=16; fi; echo $$jobs)
 # Optional simulation-time threading. Set VERILATOR_THREADS to >1 in a
 # Makefile (before including this file) to build a multi-threaded sim.
 VERILATOR_THREADS ?= 1
@@ -44,13 +47,25 @@ XRAND_ARGS  ?= +verilator+rand+reset+2 +verilator+seed+$(XRAND_SEED)
 
 BUILD_DIR  ?= $(CURDIR)/build
 
+## Coverage is opt-in: set COVERAGE=1 on the make command line to enable it.
+## Verilator's coverage instrumentation roughly doubles its own analysis time
+## and bloats generated C++ — too expensive for big designs and not needed on
+## every run.  Lint + assertions still run unconditionally.
+ifneq ($(COVERAGE),)
+COVERAGE_FLAGS := --coverage
+else
+COVERAGE_FLAGS :=
+endif
+
 COMMON_FLAGS := \
   -sv --cc --exe --build -j $(VERILATOR_JOBS) \
   $(THREAD_FLAGS) \
   -Wall \
   --assert \
-  --coverage \
-  -CFLAGS "-std=c++17 -I$(REPO_ROOT)/dv/common"
+  $(COVERAGE_FLAGS) \
+  --output-split 20000 \
+  --output-split-cfuncs 500 \
+  -CFLAGS "-std=c++17 -O1 -I$(REPO_ROOT)/dv/common"
 
 # ── Multi-test mode ─────────────────────────────────────
 
