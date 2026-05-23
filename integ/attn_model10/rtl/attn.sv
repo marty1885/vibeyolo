@@ -1,41 +1,24 @@
 // Copyright (c) 2026 vibeyolo
 // SPDX-License-Identifier: Apache-2.0
 //
-// attn — YOLO26n /model.10 PSA attention block, STRUCTURAL shim.
+// attn — YOLO26n /model.10 PSA attention block.
 //
-// Replaces the previous SV-real behavioral block with a structural
-// composition of the existing leaf IPs:
-//   * i32_to_fp16 / fp16_fma         — int8 dequant + scale
-//   * hw/ip/flash_attn               — tiled fp16 attention (Q,K,V → O)
-//   * fp16_fma / fp16_to_i8_sat      — residual add chain + requant
+// Computes the attention sub-graph that sits between the qkv conv and the
+// proj conv, returning ATTN_OUT (= attention(qkv) + pe), int8 @ S_AOUT:
 //
-// Topology (verified vs ONNX in extract.py):
+//   QKV[256,20,20] int8 ─▶ dequant(×S_QKV) ─▶ reshape/split Q,K,V
+//                          ─▶ flash_attn ─▶ O[2,400,64] fp16
+//   O ─▶ reshape[128,20,20] ─▶ (+ pe·S_PE) ─▶ ×INV_S_AOUT ─▶ sat_i8 ─▶ ATTN_OUT
 //
-//   QKV[256,20,20]  ──┐
-//                     │   ┌─────────────┐
-//   reshape+split    →│   │ flash_attn  │ → O[2,400,64] (fp16)
-//                     │   └─────────────┘
-//                     │           │
-//                     ▼           ▼
-//             (dequant to fp16)   ┐    pe-add and proj-conv happen
-//                                 │    EXTERNAL to this block in the
-//                                 ▼    real chip; here we simply route
-//                                 │    O through a keep-alive XOR so
-//                                 │    Verilator retains the IP.
-//                                 │
-//   proj/spl1/ffn1[128,20,20] int8─┘
-//                  │
-//                  ▼
-//      (3-input fp16 add tree, one stage per addend)
-//                  │
-//                  ▼
-//      ×INV_S_OUT_FP16 + fp16_to_i8_sat → final_i8 to odata_o
+// The proj conv, the proj+spl1 residual, the ffn convs, and the proj_res+ffn1
+// residual all happen EXTERNAL to this block (proj/ffn are conv_stage layers;
+// the two residual adds are add_rq glue in the core). So this block's contract
+// is purely: two int8 input streams (qkv 256-ch, pe 128-ch) → one int8 output
+// stream (attn_out 128-ch), all raster (token = h*W+w), channel-parallel.
 //
-// Port interface is byte-identical to the previous block so the
-// existing extract.py / TB / golden_final_i8.hex compare unchanged.
-// The DV's bit-exact check is on the residual chain (proj+spl1+ffn1)
-// quantized to S_OUT; flash_attn's integration here primarily exercises
-// the wiring and verilator-elaborates the production tile sizes.
+// Built from leaf IPs: i32_to_fp16, fp16_fma, flash_attn, fp16_to_i8_sat.
+// Per-tensor scales (S_QKV, S_PE, INV_S_AOUT) are pinned at elaboration via
+// attn_scales_pkg (the chip's calibrated constants).
 
 module attn #(
   parameter int H        = 20,
@@ -62,18 +45,6 @@ module attn #(
   output logic                              pe_ready_o,
   input  logic signed [C_FE-1:0][7:0]       pe_data_i,
 
-  input  logic                              proj_valid_i,
-  output logic                              proj_ready_o,
-  input  logic signed [C_FE-1:0][7:0]       proj_data_i,
-
-  input  logic                              spl1_valid_i,
-  output logic                              spl1_ready_o,
-  input  logic signed [C_FE-1:0][7:0]       spl1_data_i,
-
-  input  logic                              ffn1_valid_i,
-  output logic                              ffn1_ready_o,
-  input  logic signed [C_FE-1:0][7:0]       ffn1_data_i,
-
   output logic                              ovalid_o,
   input  logic                              oready_i,
   output logic signed [C_FE-1:0][7:0]       odata_o,
@@ -87,18 +58,16 @@ module attn #(
   localparam int CntW   = (N <= 1) ? 1 : $clog2(N) + 1;
   // Pipeline depths:
   localparam int QKV_LAT = 2;                    // i32_to_fp16 → fp16_fma
-  localparam int RES_LAT = 6;                    // see residual chain below
+  // ATTN_OUT chain: i2f → fma(×S_PE) → fma(O+pe) → fma(×INV_S_AOUT) → sat_i8
+  localparam int AO_LAT  = 5;
   localparam int DRIVE_TAIL_Q = QKV_LAT;
-  localparam int DRIVE_TAIL_R = RES_LAT;
+  localparam int DRIVE_TAIL_A = AO_LAT;
 
   // ── Frame stores (int8) ──────────────────────────────────────
   logic signed [C_QKV-1:0][7:0] qkv_mem [N];
   logic signed [C_FE-1:0][7:0]  pe_mem  [N];
-  logic signed [C_FE-1:0][7:0]  proj_mem[N];
-  logic signed [C_FE-1:0][7:0]  spl1_mem[N];
-  logic signed [C_FE-1:0][7:0]  ffn1_mem[N];
 
-  // Output frame store (filled by residual chain).
+  // Output frame store (filled by the attn-out chain).
   logic signed [C_FE-1:0][7:0]  out_mem [N];
 
   // ── FSM ──────────────────────────────────────────────────────
@@ -106,70 +75,52 @@ module attn #(
     S_IDLE,
     S_LOAD_QKV,
     S_LOAD_PE,
-    S_LOAD_PROJ,
-    S_LOAD_SPL1,
-    S_LOAD_FFN1,
     S_QKV_DEQ,
     S_FA_PULSE,
     S_FA_WAIT,
-    S_RES,
+    S_AO,
     S_DRAIN,
     S_DONE
   } state_e;
   state_e state_q, state_d;
 
-  logic [CntW-1:0] qkv_cnt_q,  qkv_cnt_d;
-  logic [CntW-1:0] pe_cnt_q,   pe_cnt_d;
-  logic [CntW-1:0] proj_cnt_q, proj_cnt_d;
-  logic [CntW-1:0] spl1_cnt_q, spl1_cnt_d;
-  logic [CntW-1:0] ffn1_cnt_q, ffn1_cnt_d;
-  logic [CntW-1:0] o_cnt_q,    o_cnt_d;
+  logic [CntW-1:0] qkv_cnt_q, qkv_cnt_d;
+  logic [CntW-1:0] pe_cnt_q,  pe_cnt_d;
+  logic [CntW-1:0] o_cnt_q,   o_cnt_d;
 
   // Phase counters for the two compute pipelines.
-  // qd_cyc counts from 0 in S_QKV_DEQ; valid output at cyc ≥ QKV_LAT
-  // for input pixel (cyc - QKV_LAT). Stays in state until cyc == N + QKV_LAT - 1.
-  logic [CntW:0]   qd_cyc_q,  qd_cyc_d;
-  logic [CntW:0]   rs_cyc_q,  rs_cyc_d;
+  logic [CntW:0]   qd_cyc_q, qd_cyc_d;
+  logic [CntW:0]   ao_cyc_q, ao_cyc_d;
 
   assign qkv_ready_o  = (state_q == S_LOAD_QKV);
   assign pe_ready_o   = (state_q == S_LOAD_PE);
-  assign proj_ready_o = (state_q == S_LOAD_PROJ);
-  assign spl1_ready_o = (state_q == S_LOAD_SPL1);
-  assign ffn1_ready_o = (state_q == S_LOAD_FFN1);
   assign ovalid_o     = (state_q == S_DRAIN);
   assign done_o       = (state_q == S_DONE);
 
-  logic qkv_fire, pe_fire, proj_fire, spl1_fire, ffn1_fire, o_fire;
-  assign qkv_fire  = qkv_valid_i  && qkv_ready_o;
-  assign pe_fire   = pe_valid_i   && pe_ready_o;
-  assign proj_fire = proj_valid_i && proj_ready_o;
-  assign spl1_fire = spl1_valid_i && spl1_ready_o;
-  assign ffn1_fire = ffn1_valid_i && ffn1_ready_o;
-  assign o_fire    = ovalid_o     && oready_i;
+  logic qkv_fire, pe_fire, o_fire;
+  assign qkv_fire = qkv_valid_i && qkv_ready_o;
+  assign pe_fire  = pe_valid_i  && pe_ready_o;
+  assign o_fire   = ovalid_o    && oready_i;
 
   // flash_attn handshake
   logic fa_start;
   logic fa_done;
 
   always_comb begin
-    state_d    = state_q;
-    qkv_cnt_d  = qkv_cnt_q;
-    pe_cnt_d   = pe_cnt_q;
-    proj_cnt_d = proj_cnt_q;
-    spl1_cnt_d = spl1_cnt_q;
-    ffn1_cnt_d = ffn1_cnt_q;
-    o_cnt_d    = o_cnt_q;
-    qd_cyc_d   = qd_cyc_q;
-    rs_cyc_d   = rs_cyc_q;
-    fa_start   = 1'b0;
+    state_d   = state_q;
+    qkv_cnt_d = qkv_cnt_q;
+    pe_cnt_d  = pe_cnt_q;
+    o_cnt_d   = o_cnt_q;
+    qd_cyc_d  = qd_cyc_q;
+    ao_cyc_d  = ao_cyc_q;
+    fa_start  = 1'b0;
 
     unique case (state_q)
       S_IDLE: begin
         if (start_i) begin
           state_d   = S_LOAD_QKV;
-          qkv_cnt_d = '0; pe_cnt_d = '0; proj_cnt_d = '0;
-          spl1_cnt_d = '0; ffn1_cnt_d = '0; o_cnt_d = '0;
-          qd_cyc_d = '0; rs_cyc_d = '0;
+          qkv_cnt_d = '0; pe_cnt_d = '0; o_cnt_d = '0;
+          qd_cyc_d  = '0; ao_cyc_d = '0;
         end
       end
       S_LOAD_QKV: begin
@@ -181,25 +132,7 @@ module attn #(
       S_LOAD_PE: begin
         if (pe_fire) begin
           pe_cnt_d = pe_cnt_q + 1'b1;
-          if (pe_cnt_q + 1'b1 == CntW'(N)) state_d = S_LOAD_PROJ;
-        end
-      end
-      S_LOAD_PROJ: begin
-        if (proj_fire) begin
-          proj_cnt_d = proj_cnt_q + 1'b1;
-          if (proj_cnt_q + 1'b1 == CntW'(N)) state_d = S_LOAD_SPL1;
-        end
-      end
-      S_LOAD_SPL1: begin
-        if (spl1_fire) begin
-          spl1_cnt_d = spl1_cnt_q + 1'b1;
-          if (spl1_cnt_q + 1'b1 == CntW'(N)) state_d = S_LOAD_FFN1;
-        end
-      end
-      S_LOAD_FFN1: begin
-        if (ffn1_fire) begin
-          ffn1_cnt_d = ffn1_cnt_q + 1'b1;
-          if (ffn1_cnt_q + 1'b1 == CntW'(N)) begin
+          if (pe_cnt_q + 1'b1 == CntW'(N)) begin
             state_d  = S_QKV_DEQ;
             qd_cyc_d = '0;
           end
@@ -207,11 +140,7 @@ module attn #(
       end
       S_QKV_DEQ: begin
         qd_cyc_d = qd_cyc_q + 1'b1;
-        // Last useful capture happens when (qd_cyc_q - QKV_LAT) == N-1,
-        // i.e. qd_cyc_q == N + QKV_LAT - 1. Transition next cycle.
-        if (qd_cyc_q == (CntW+1)'(N + DRIVE_TAIL_Q - 1)) begin
-          state_d = S_FA_PULSE;
-        end
+        if (qd_cyc_q == (CntW+1)'(N + DRIVE_TAIL_Q - 1)) state_d = S_FA_PULSE;
       end
       S_FA_PULSE: begin
         fa_start = 1'b1;
@@ -219,13 +148,13 @@ module attn #(
       end
       S_FA_WAIT: begin
         if (fa_done) begin
-          state_d  = S_RES;
-          rs_cyc_d = '0;
+          state_d  = S_AO;
+          ao_cyc_d = '0;
         end
       end
-      S_RES: begin
-        rs_cyc_d = rs_cyc_q + 1'b1;
-        if (rs_cyc_q == (CntW+1)'(N + DRIVE_TAIL_R - 1)) state_d = S_DRAIN;
+      S_AO: begin
+        ao_cyc_d = ao_cyc_q + 1'b1;
+        if (ao_cyc_q == (CntW+1)'(N + DRIVE_TAIL_A - 1)) state_d = S_DRAIN;
       end
       S_DRAIN: begin
         if (o_fire) begin
@@ -236,9 +165,8 @@ module attn #(
       S_DONE: begin
         if (start_i) begin
           state_d   = S_LOAD_QKV;
-          qkv_cnt_d = '0; pe_cnt_d = '0; proj_cnt_d = '0;
-          spl1_cnt_d = '0; ffn1_cnt_d = '0; o_cnt_d = '0;
-          qd_cyc_d = '0; rs_cyc_d = '0;
+          qkv_cnt_d = '0; pe_cnt_d = '0; o_cnt_d = '0;
+          qd_cyc_d  = '0; ao_cyc_d = '0;
         end
       end
       default: state_d = S_IDLE;
@@ -247,36 +175,28 @@ module attn #(
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      state_q    <= S_IDLE;
-      qkv_cnt_q  <= '0; pe_cnt_q  <= '0; proj_cnt_q <= '0;
-      spl1_cnt_q <= '0; ffn1_cnt_q <= '0; o_cnt_q <= '0;
-      qd_cyc_q   <= '0; rs_cyc_q  <= '0;
+      state_q   <= S_IDLE;
+      qkv_cnt_q <= '0; pe_cnt_q <= '0; o_cnt_q <= '0;
+      qd_cyc_q  <= '0; ao_cyc_q <= '0;
     end else begin
-      state_q    <= state_d;
-      qkv_cnt_q  <= qkv_cnt_d;
-      pe_cnt_q   <= pe_cnt_d;
-      proj_cnt_q <= proj_cnt_d;
-      spl1_cnt_q <= spl1_cnt_d;
-      ffn1_cnt_q <= ffn1_cnt_d;
-      o_cnt_q    <= o_cnt_d;
-      qd_cyc_q   <= qd_cyc_d;
-      rs_cyc_q   <= rs_cyc_d;
+      state_q   <= state_d;
+      qkv_cnt_q <= qkv_cnt_d;
+      pe_cnt_q  <= pe_cnt_d;
+      o_cnt_q   <= o_cnt_d;
+      qd_cyc_q  <= qd_cyc_d;
+      ao_cyc_q  <= ao_cyc_d;
     end
   end
 
   // ── Frame-store writes ───────────────────────────────────────
   always_ff @(posedge clk_i) begin
-    if (qkv_fire)  qkv_mem [qkv_cnt_q [CntW-2:0]] <= qkv_data_i;
-    if (pe_fire)   pe_mem  [pe_cnt_q  [CntW-2:0]] <= pe_data_i;
-    if (proj_fire) proj_mem[proj_cnt_q[CntW-2:0]] <= proj_data_i;
-    if (spl1_fire) spl1_mem[spl1_cnt_q[CntW-2:0]] <= spl1_data_i;
-    if (ffn1_fire) ffn1_mem[ffn1_cnt_q[CntW-2:0]] <= ffn1_data_i;
+    if (qkv_fire) qkv_mem[qkv_cnt_q[CntW-2:0]] <= qkv_data_i;
+    if (pe_fire)  pe_mem [pe_cnt_q [CntW-2:0]] <= pe_data_i;
   end
 
   // ─── QKV dequant pipeline ───────────────────────────────────
   // At qd_cyc_q == k drive qkv_mem[k] (if k<N) through 256 parallel
-  // i32_to_fp16 → fp16_fma(×S_QKV) chains. The result is available
-  // QKV_LAT=2 cycles later, capture into Q/K/V arrays.
+  // i32_to_fp16 → fp16_fma(×S_QKV) chains; capture QKV_LAT later.
   logic [CntW-1:0] qd_drive_idx;
   logic            qd_drive_valid;
   logic [CntW-1:0] qd_cap_idx;
@@ -323,13 +243,15 @@ module attn #(
   always_ff @(posedge clk_i) begin
     if (qd_cap_valid) begin
       for (int h = 0; h < HEADS; h++) begin
-        int base_ch = h * (DIM_Q + DIM_K + DIM_V);
+        // NB: inline (no `int base_ch = h*...`) — a procedural var with an
+        // initializer is static, so its init runs once with h=0 and head 1
+        // would silently read head 0's channels.
         for (int d = 0; d < DIM_Q; d++)
-          Q_arr[h*N*DIM_Q + qd_cap_idx*DIM_Q + d] <= qkv_fp[base_ch + d];
+          Q_arr[h*N*DIM_Q + qd_cap_idx*DIM_Q + d] <= qkv_fp[h*(DIM_Q+DIM_K+DIM_V) + d];
         for (int d = 0; d < DIM_K; d++)
-          K_arr[h*N*DIM_Q + qd_cap_idx*DIM_Q + d] <= qkv_fp[base_ch + DIM_Q + d];
+          K_arr[h*N*DIM_Q + qd_cap_idx*DIM_Q + d] <= qkv_fp[h*(DIM_Q+DIM_K+DIM_V) + DIM_Q + d];
         for (int d = 0; d < DIM_V; d++)
-          V_arr[h*N*DIM_V + qd_cap_idx*DIM_V + d] <= qkv_fp[base_ch + DIM_Q + DIM_K + d];
+          V_arr[h*N*DIM_V + qd_cap_idx*DIM_V + d] <= qkv_fp[h*(DIM_Q+DIM_K+DIM_V) + DIM_Q + DIM_K + d];
       end
     end
   end
@@ -369,88 +291,80 @@ module attn #(
     .o_flat_o(o_flat)
   );
 
-  // Keep flash_attn's output observable so Verilator doesn't prune the
-  // IP. XOR-reduce o_flat into a 1-bit alive signal latched per frame.
-  logic fa_alive_q;
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni)                 fa_alive_q <= 1'b0;
-    else if (state_q == S_FA_WAIT && fa_done)
-      fa_alive_q <= ^o_flat;
-  end
-
-  // ─── Residual chain ─────────────────────────────────────────
-  // Per-channel pipeline (C_FE=128 parallel):
-  //   stage 0:    feed proj/spl1/ffn1 int8                              (comb)
-  //   stage 1:    i32_to_fp16 → proj_fp, spl1_fp, ffn1_fp               (reg)
-  //   stage 2:    ta = fp16_fma(proj_fp, S_PROJ, 0)
-  //               tb = fp16_fma(spl1_fp, S_SPL1, 0)
-  //               tc = fp16_fma(ffn1_fp, S_FFN1, 0)                      (reg)
-  //   stage 3:    ab = fp16_fma(ta, 1.0, tb)                             (reg)
-  //   stage 4:    abc = fp16_fma(ab, 1.0, tc)                            (reg)
-  //   stage 5:    y_fp = fp16_fma(abc, INV_S_OUT_FP16, 0)                (reg)
-  //   stage 6:    final_i8 = fp16_to_i8_sat(y_fp)                        (reg)
-  // RES_LAT = 6 from input to captured int8.
-
+  // ─── ATTN_OUT chain ─────────────────────────────────────────
+  // Per-channel pipeline (C_FE=128 parallel) over N tokens:
+  //   drive : pe_pix[c] int8, O[c] fp16 (= flash_attn O for this token/chan)
+  //   r1    : pe_s0 = i32_to_fp16(pe_pix[c])              ; o_d1 <= O[c]
+  //   r2    : pe_fp = fp16_fma(pe_s0, S_PE, 0)            ; o_d2 <= o_d1
+  //   r3    : sum   = fp16_fma(o_d2, 1.0, pe_fp)   (= O + pe)
+  //   r4    : y_fp  = fp16_fma(sum, INV_S_AOUT, 0)
+  //   r5    : i8    = fp16_to_i8_sat(y_fp)
+  // AO_LAT = 5 from driven token to captured int8.
+  //
+  // O channel layout: ATTN_OUT channel c == head (c/DIM_V), value-dim
+  // (c%DIM_V). flash_attn packs O as o_flat[16*(h*N*DIM_V + n*DIM_V + d)].
   localparam logic [15:0] FP16_ONE  = 16'h3C00;
   localparam logic [15:0] FP16_ZERO = 16'h0000;
 
-  logic [CntW-1:0] rs_drive_idx;
-  logic            rs_drive_valid;
-  logic [CntW-1:0] rs_cap_idx;
-  logic            rs_cap_valid;
-  assign rs_drive_valid = (state_q == S_RES) && (rs_cyc_q < (CntW+1)'(N));
-  assign rs_drive_idx   = rs_drive_valid ? rs_cyc_q[CntW-1:0] : '0;
-  assign rs_cap_valid   = (state_q == S_RES) && (rs_cyc_q >= (CntW+1)'(RES_LAT))
-                                              && (rs_cyc_q <  (CntW+1)'(N + RES_LAT));
-  assign rs_cap_idx     = rs_cap_valid ? (rs_cyc_q[CntW-1:0] - CntW'(RES_LAT)) : '0;
+  logic [CntW-1:0] ao_drive_idx;
+  logic            ao_drive_valid;
+  logic [CntW-1:0] ao_cap_idx;
+  logic            ao_cap_valid;
+  assign ao_drive_valid = (state_q == S_AO) && (ao_cyc_q < (CntW+1)'(N));
+  assign ao_drive_idx   = ao_drive_valid ? ao_cyc_q[CntW-1:0] : '0;
+  assign ao_cap_valid   = (state_q == S_AO) && (ao_cyc_q >= (CntW+1)'(AO_LAT))
+                                            && (ao_cyc_q <  (CntW+1)'(N + AO_LAT));
+  assign ao_cap_idx     = ao_cap_valid ? (ao_cyc_q[CntW-1:0] - CntW'(AO_LAT)) : '0;
 
-  logic signed [C_FE-1:0][7:0] proj_pix, spl1_pix, ffn1_pix;
-  assign proj_pix = proj_mem[rs_drive_idx];
-  assign spl1_pix = spl1_mem[rs_drive_idx];
-  assign ffn1_pix = ffn1_mem[rs_drive_idx];
+  logic signed [C_FE-1:0][7:0] pe_drive_pix;
+  assign pe_drive_pix = pe_mem[ao_drive_idx];
 
-  logic signed [C_FE-1:0][7:0] final_i8;
+  // Unpack flash_attn O into a per-token array O_arr[n][c], channel
+  // c == head*(DIM_V) + value-dim. Static loops → constant part-selects of
+  // o_flat (no runtime base), then a clean per-token array read below.
+  logic [15:0] O_arr [N][C_FE];
+  always_comb begin
+    for (int n = 0; n < N; n++)
+      for (int h = 0; h < HEADS; h++)
+        for (int d = 0; d < DIM_V; d++)
+          O_arr[n][h*DIM_V + d] = o_flat[16*(h*N*DIM_V + n*DIM_V + d) +: 16];
+  end
 
-  for (genvar c = 0; c < C_FE; c++) begin : g_res
-    logic signed [31:0] proj_x32, spl1_x32, ffn1_x32;
-    assign proj_x32 = 32'($signed(proj_pix[c]));
-    assign spl1_x32 = 32'($signed(spl1_pix[c]));
-    assign ffn1_x32 = 32'($signed(ffn1_pix[c]));
+  logic signed [C_FE-1:0][7:0] attn_i8;
 
-    logic [15:0] proj_fp, spl1_fp, ffn1_fp;
-    logic [4:0]  shp, shs, shf;
-    i32_to_fp16 u_pi2f (.clk_i, .rst_ni, .x_i(proj_x32), .y_o(proj_fp), .shift_o(shp));
-    i32_to_fp16 u_si2f (.clk_i, .rst_ni, .x_i(spl1_x32), .y_o(spl1_fp), .shift_o(shs));
-    i32_to_fp16 u_fi2f (.clk_i, .rst_ni, .x_i(ffn1_x32), .y_o(ffn1_fp), .shift_o(shf));
+  for (genvar c = 0; c < C_FE; c++) begin : g_ao
+    // O for the driven token, this channel.
+    logic [15:0] o_val;
+    assign o_val = O_arr[ao_drive_idx][c];
 
-    logic [15:0] ta, tb, tc;
-    fp16_fma u_ta (.clk_i, .rst_ni, .a_i(proj_fp), .b_i(S_PROJ_FP16), .c_i(FP16_ZERO), .y_o(ta));
-    fp16_fma u_tb (.clk_i, .rst_ni, .a_i(spl1_fp), .b_i(S_SPL1_FP16), .c_i(FP16_ZERO), .y_o(tb));
-    fp16_fma u_tc (.clk_i, .rst_ni, .a_i(ffn1_fp), .b_i(S_FFN1_FP16), .c_i(FP16_ZERO), .y_o(tc));
+    // pe dequant: int8 → fp16 → ×S_PE
+    logic signed [31:0] pe_x32;
+    logic [15:0]        pe_s0;
+    logic [4:0]         pe_sh;
+    assign pe_x32 = 32'($signed(pe_drive_pix[c]));
+    i32_to_fp16 u_pi2f (.clk_i, .rst_ni, .x_i(pe_x32), .y_o(pe_s0), .shift_o(pe_sh));
 
-    // tc must be delayed 1 cycle to align with ab in the (ab + tc) fma:
-    // ta/tb/tc all emerge at the same pipeline stage; u_ab combines ta+tb
-    // and outputs one cycle later, so tc must lag by 1 cycle to match.
-    logic [15:0] tc_dly;
-    always_ff @(posedge clk_i) tc_dly <= tc;
+    logic [15:0] pe_fp;
+    fp16_fma u_pe (.clk_i, .rst_ni, .a_i(pe_s0), .b_i(S_PE_FP16), .c_i(FP16_ZERO), .y_o(pe_fp));
 
-    logic [15:0] ab, abc, y_fp;
-    fp16_fma u_ab  (.clk_i, .rst_ni, .a_i(ta),  .b_i(FP16_ONE), .c_i(tb),     .y_o(ab));
-    fp16_fma u_abc (.clk_i, .rst_ni, .a_i(ab),  .b_i(FP16_ONE), .c_i(tc_dly), .y_o(abc));
-    fp16_fma u_yf  (.clk_i, .rst_ni, .a_i(abc), .b_i(INV_S_OUT_FP16), .c_i(FP16_ZERO), .y_o(y_fp));
+    // Delay O by 2 cycles to align with pe_fp (i2f + fma).
+    logic [15:0] o_d1, o_d2;
+    always_ff @(posedge clk_i) begin o_d1 <= o_val; o_d2 <= o_d1; end
+
+    logic [15:0] sum, y_fp;
+    fp16_fma u_sum (.clk_i, .rst_ni, .a_i(o_d2), .b_i(FP16_ONE),       .c_i(pe_fp),     .y_o(sum));
+    fp16_fma u_y   (.clk_i, .rst_ni, .a_i(sum),  .b_i(INV_S_AOUT_FP16), .c_i(FP16_ZERO), .y_o(y_fp));
 
     logic signed [7:0] yi8;
     fp16_to_i8_sat u_q (.clk_i, .rst_ni, .x_i(y_fp), .y_o(yi8));
+    assign attn_i8[c] = yi8;
 
-    assign final_i8[c] = yi8;
-
-    // keep unused shift outputs from being optimised away
-    logic _u; assign _u = ^{shp, shs, shf};
+    logic _u; assign _u = ^pe_sh;
     logic _u_keep; always_ff @(posedge clk_i) _u_keep <= _u;
   end
 
   always_ff @(posedge clk_i) begin
-    if (rs_cap_valid) out_mem[rs_cap_idx] <= final_i8;
+    if (ao_cap_valid) out_mem[ao_cap_idx] <= attn_i8;
   end
 
   // ─── Drain ──────────────────────────────────────────────────
@@ -458,11 +372,9 @@ module attn #(
     odata_o = out_mem[o_cnt_q[CntW-2:0]];
   end
 
-  // Lint keep-alive for fa_alive_q and top counter bits.
+  // Lint keep-alive for top counter bits.
   logic _unused;
-  assign _unused = ^{fa_alive_q,
-                     qkv_cnt_q[CntW-1], pe_cnt_q[CntW-1], proj_cnt_q[CntW-1],
-                     spl1_cnt_q[CntW-1], ffn1_cnt_q[CntW-1], o_cnt_q[CntW-1],
-                     qd_cyc_q[CntW], rs_cyc_q[CntW]};
+  assign _unused = ^{qkv_cnt_q[CntW-1], pe_cnt_q[CntW-1], o_cnt_q[CntW-1],
+                     qd_cyc_q[CntW], ao_cyc_q[CntW]};
 
 endmodule

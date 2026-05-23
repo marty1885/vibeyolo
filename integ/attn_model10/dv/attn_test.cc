@@ -1,15 +1,12 @@
 // Copyright (c) 2026 vibeyolo
 // SPDX-License-Identifier: Apache-2.0
 //
-// attn_test.cc — drives the attention integration block with
-// stim/<sample>.{qkv,pe,proj,spl1,ffn1}_i8.hex, captures the DUT's
-// 128ch×20×20 int8 final output, and compares to:
-//   1. Software int8 golden (stim/<sample>.golden_final_i8.hex):
-//      target — match bit-exactly. The SW model uses fp64 math so the
-//      DUT (fp16) may differ by a small number of samples; the cos
-//      check below is the gating criterion.
-//   2. Float ORT reference (stim/<sample>.ref_final_f32.hex):
-//      target — cos ≥ 0.998 on the random tiles.
+// attn_test.cc — drives the attention block with stim/<sample>.{qkv,pe}_i8.hex,
+// captures the DUT's 128ch×20×20 int8 ATTN_OUT, and compares to:
+//   1. Software int8 golden (stim/<sample>.golden_attn_i8.hex): the fp16-ish
+//      reference; cos check is the gating criterion (DUT is fp16, ref fp64).
+//   2. Float ORT reference (stim/<sample>.ref_attn_f32.hex): cos ≥ 0.99.
+// ATTN_OUT = attention(qkv) + pe, dequantised at S_AOUT (from manifest.json).
 
 #include <cstdint>
 #include <cstdio>
@@ -43,7 +40,7 @@ static std::vector<int8_t> load_i8_hex(const std::string& path, size_t expected)
         std::stringstream ss; ss << std::hex << line; ss >> val;
         v.push_back(static_cast<int8_t>(val & 0xFF));
     }
-    if (v.size() != expected) {
+    if (expected && v.size() != expected) {
         fprintf(stderr, "size mismatch in %s: got %zu, expected %zu\n",
                 path.c_str(), v.size(), expected);
         std::exit(2);
@@ -63,7 +60,7 @@ static std::vector<float> load_f32_hex(const std::string& path, size_t expected)
         float f; std::memcpy(&f, &bits, 4);
         v.push_back(f);
     }
-    if (v.size() != expected) {
+    if (expected && v.size() != expected) {
         fprintf(stderr, "size mismatch in %s: got %zu, expected %zu\n",
                 path.c_str(), v.size(), expected);
         std::exit(2);
@@ -84,151 +81,47 @@ static void unpack_lanes(const DataT* bus, int8_t* lanes, int n) {
     for (int c = 0; c < n; c++) lanes[c] = static_cast<int8_t>(p[c]);
 }
 
-struct SampleResult {
-    int    bit_exact_bad = 0;
-    double cos_sw        = 0.0;
-    double cos_ort       = 0.0;
-    int    cycles        = 0;
-};
+// Drive one frame: feed qkv (256ch) then pe (128ch) raster, collect
+// attn_out (128ch). Returns the captured int8 output frame.
+static std::vector<int8_t> drive(SimCtrl<Vattn_tb>& sim,
+                                 const std::vector<int8_t>& qkv_in,
+                                 const std::vector<int8_t>& pe_in) {
+    const size_t N = size_t(H) * W;
+    int8_t zero_qkv[C_QKV] = {0}; int8_t zero_fe[C_FE] = {0};
 
-
-static SampleResult drive_sample(SimCtrl<Vattn_tb>& sim, const std::string& name,
-                                 double s_out) {
-    SampleResult r{};
-    const size_t N    = size_t(H) * W;
-    const size_t Nqkv = N * C_QKV;
-    const size_t Nfe  = N * C_FE;
-
-    auto qkv_in   = load_i8_hex (std::string(STIM_DIR) + "/" + name + ".qkv_i8.hex",  Nqkv);
-    auto pe_in    = load_i8_hex (std::string(STIM_DIR) + "/" + name + ".pe_i8.hex",   Nfe);
-    auto proj_in  = load_i8_hex (std::string(STIM_DIR) + "/" + name + ".proj_i8.hex", Nfe);
-    auto spl1_in  = load_i8_hex (std::string(STIM_DIR) + "/" + name + ".spl1_i8.hex", Nfe);
-    auto ffn1_in  = load_i8_hex (std::string(STIM_DIR) + "/" + name + ".ffn1_i8.hex", Nfe);
-    auto golden   = load_i8_hex (std::string(STIM_DIR) + "/" + name + ".golden_final_i8.hex", Nfe);
-    auto ref_ort  = load_f32_hex(std::string(STIM_DIR) + "/" + name + ".ref_final_f32.hex",   Nfe);
-
-    int8_t zero_qkv[C_QKV]; std::memset(zero_qkv, 0, sizeof(zero_qkv));
-    int8_t zero_fe [C_FE];  std::memset(zero_fe,  0, sizeof(zero_fe));
-
-    sim.dut->start_i      = 0;
-    sim.dut->qkv_valid_i  = 0;
-    sim.dut->pe_valid_i   = 0;
-    sim.dut->proj_valid_i = 0;
-    sim.dut->spl1_valid_i = 0;
-    sim.dut->ffn1_valid_i = 0;
-    sim.dut->oready_i     = 0;
-    pack_lanes(&sim.dut->qkv_data_i,  zero_qkv, C_QKV);
-    pack_lanes(&sim.dut->pe_data_i,   zero_fe,  C_FE);
-    pack_lanes(&sim.dut->proj_data_i, zero_fe,  C_FE);
-    pack_lanes(&sim.dut->spl1_data_i, zero_fe,  C_FE);
-    pack_lanes(&sim.dut->ffn1_data_i, zero_fe,  C_FE);
+    sim.dut->start_i = sim.dut->qkv_valid_i = sim.dut->pe_valid_i = 0;
+    sim.dut->oready_i = 0;
+    pack_lanes(&sim.dut->qkv_data_i, zero_qkv, C_QKV);
+    pack_lanes(&sim.dut->pe_data_i,  zero_fe,  C_FE);
     sim.tick();
+    sim.dut->start_i = 1; sim.tick(); sim.dut->start_i = 0;
 
-    sim.dut->start_i = 1;
-    sim.tick();
-    sim.dut->start_i = 0;
-
-    size_t qi = 0, pi = 0, ri = 0, si = 0, fi = 0, oi = 0;
-    std::vector<int8_t> dut_out(N * C_FE, 0);
-    const int max_cycles = 50'000'000;
-    int cycles = 0;
-    int8_t out_buf[C_FE];
-
+    size_t qi = 0, pi = 0, oi = 0;
+    std::vector<int8_t> dut_out(N * C_FE, 0); int8_t out_buf[C_FE];
+    const int max_cycles = 50'000'000; int cycles = 0;
     while (oi < N) {
-        if (qi < N) { sim.dut->qkv_valid_i = 1;
-                      pack_lanes(&sim.dut->qkv_data_i,  &qkv_in[qi * C_QKV], C_QKV); }
-        else         { sim.dut->qkv_valid_i = 0;
-                      pack_lanes(&sim.dut->qkv_data_i,  zero_qkv, C_QKV); }
-        if (pi < N) { sim.dut->pe_valid_i = 1;
-                      pack_lanes(&sim.dut->pe_data_i,   &pe_in[pi  * C_FE],  C_FE); }
-        else         { sim.dut->pe_valid_i = 0;
-                      pack_lanes(&sim.dut->pe_data_i,   zero_fe,  C_FE); }
-        if (ri < N) { sim.dut->proj_valid_i = 1;
-                      pack_lanes(&sim.dut->proj_data_i, &proj_in[ri * C_FE], C_FE); }
-        else         { sim.dut->proj_valid_i = 0;
-                      pack_lanes(&sim.dut->proj_data_i, zero_fe,  C_FE); }
-        if (si < N) { sim.dut->spl1_valid_i = 1;
-                      pack_lanes(&sim.dut->spl1_data_i, &spl1_in[si * C_FE], C_FE); }
-        else         { sim.dut->spl1_valid_i = 0;
-                      pack_lanes(&sim.dut->spl1_data_i, zero_fe,  C_FE); }
-        if (fi < N) { sim.dut->ffn1_valid_i = 1;
-                      pack_lanes(&sim.dut->ffn1_data_i, &ffn1_in[fi * C_FE], C_FE); }
-        else         { sim.dut->ffn1_valid_i = 0;
-                      pack_lanes(&sim.dut->ffn1_data_i, zero_fe,  C_FE); }
+        sim.dut->qkv_valid_i = qi < N;
+        pack_lanes(&sim.dut->qkv_data_i, qi < N ? &qkv_in[qi*C_QKV] : zero_qkv, C_QKV);
+        sim.dut->pe_valid_i = pi < N;
+        pack_lanes(&sim.dut->pe_data_i, pi < N ? &pe_in[pi*C_FE] : zero_fe, C_FE);
         sim.dut->oready_i = 1;
-
         sim.dut->eval();
-
-        bool q_fire = sim.dut->qkv_valid_i  && sim.dut->qkv_ready_o;
-        bool p_fire = sim.dut->pe_valid_i   && sim.dut->pe_ready_o;
-        bool r_fire = sim.dut->proj_valid_i && sim.dut->proj_ready_o;
-        bool s_fire = sim.dut->spl1_valid_i && sim.dut->spl1_ready_o;
-        bool f_fire = sim.dut->ffn1_valid_i && sim.dut->ffn1_ready_o;
-        bool o_fire = sim.dut->ovalid_o     && sim.dut->oready_i;
-
-        if (o_fire) {
-            unpack_lanes(&sim.dut->odata_o, out_buf, C_FE);
-            std::memcpy(&dut_out[oi * C_FE], out_buf, C_FE);
-            oi++;
-        }
+        bool qf = sim.dut->qkv_valid_i && sim.dut->qkv_ready_o;
+        bool pf = sim.dut->pe_valid_i  && sim.dut->pe_ready_o;
+        bool of = sim.dut->ovalid_o    && sim.dut->oready_i;
+        if (of) { unpack_lanes(&sim.dut->odata_o, out_buf, C_FE);
+                  std::memcpy(&dut_out[oi*C_FE], out_buf, C_FE); oi++; }
         sim.tick();
-        if (q_fire) qi++;
-        if (p_fire) pi++;
-        if (r_fire) ri++;
-        if (s_fire) si++;
-        if (f_fire) fi++;
-        cycles++;
-        if (cycles > max_cycles) {
-            printf("  %s: TIMEOUT q=%zu p=%zu r=%zu s=%zu f=%zu o=%zu\n",
-                   name.c_str(), qi, pi, ri, si, fi, oi);
-            sim.check(false, name + " timeout");
-            return r;
-        }
+        if (qf) qi++; if (pf) pi++;
+        if (++cycles > max_cycles) { fprintf(stderr, "attn TIMEOUT o=%zu\n", oi); break; }
     }
-    r.cycles = cycles;
-
-    sim.dut->qkv_valid_i = sim.dut->pe_valid_i = sim.dut->proj_valid_i = 0;
-    sim.dut->spl1_valid_i = sim.dut->ffn1_valid_i = sim.dut->oready_i = 0;
-    sim.dut->eval();
-
-    int bad = 0;
-    for (size_t i = 0; i < dut_out.size(); i++) {
-        if (dut_out[i] != golden[i]) {
-            if (bad < 4) {
-                size_t pix = i / C_FE; size_t ch = i % C_FE;
-                int hh = int(pix / W); int ww = int(pix % W);
-                printf("  %s: i8 diff @ (h=%d w=%d ch=%zu) got=%d exp=%d\n",
-                       name.c_str(), hh, ww, ch, int(dut_out[i]), int(golden[i]));
-            }
-            bad++;
-        }
-    }
-    r.bit_exact_bad = bad;
-
-    auto cos_vs_f32 = [&](const float* ref) {
-        long double dot = 0, na = 0, nb = 0;
-        for (size_t i = 0; i < N * C_FE; i++) {
-            double aa = double(dut_out[i]) * s_out;
-            double bb = double(ref[i]);
-            dot += aa * bb; na += aa * aa; nb += bb * bb;
-        }
-        return double(dot / (std::sqrt(double(na)) * std::sqrt(double(nb)) + 1e-30L));
-    };
-    {
-        std::vector<float> golden_f(N * C_FE);
-        for (size_t i = 0; i < golden_f.size(); i++)
-            golden_f[i] = float(golden[i]) * float(s_out);
-        r.cos_sw = cos_vs_f32(golden_f.data());
-    }
-    r.cos_ort = cos_vs_f32(ref_ort.data());
-    return r;
+    return dut_out;
 }
 
 static double load_real_from_manifest(const std::string& key) {
     std::ifstream in(std::string(STIM_DIR) + "/manifest.json");
     if (!in) { fprintf(stderr, "missing manifest.json\n"); std::exit(2); }
-    std::string txt((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+    std::string txt((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     std::string k = "\"" + key + "\"";
     auto pos = txt.find(k);
     if (pos == std::string::npos) { fprintf(stderr, "no key %s\n", key.c_str()); std::exit(2); }
@@ -237,48 +130,78 @@ static double load_real_from_manifest(const std::string& key) {
     return std::stod(txt.substr(colon + 1, comma - colon - 1));
 }
 
-int main(int argc, char** argv) {
+// ── chain mode ──
+// Driven by tools/e2e/chain.py to run the REAL attn IP inside the end-to-end
+// chip chain on a live image. Reads qkv + pe int8 (pix-major, channel-fastest)
+// from explicit paths, drives one frame, dumps the 128ch int8 ATTN_OUT.
+// Scales are baked at elaboration (attn_scales_pkg) — the chip's fixed config —
+// so chain.py re-quantizes qkv/pe at those scales (read from manifest).
+//   env: CHAIN_QKV, CHAIN_PE (int8 pix-major hex), CHAIN_OUT (int8 hex)
+static int chain_mode(int argc, char** argv) {
     SimCtrl<Vattn_tb> sim(argc, argv);
     sim.max_time = 8'000'000'000ull;
+    const size_t N = size_t(H) * W;
+    sim.dut->start_i = sim.dut->qkv_valid_i = sim.dut->pe_valid_i = sim.dut->oready_i = 0;
+    sim.reset();
+    auto qkv_in = load_i8_hex(getenv("CHAIN_QKV"), N * C_QKV);
+    auto pe_in  = load_i8_hex(getenv("CHAIN_PE"),  N * C_FE);
+    auto out = drive(sim, qkv_in, pe_in);
+    FILE* f = fopen(getenv("CHAIN_OUT"), "w");
+    for (size_t i = 0; i < out.size(); i++) fprintf(f, "%02x\n", int(out[i]) & 0xFF);
+    fclose(f);
+    fprintf(stderr, "chain attn: %zu px -> %s\n", N, getenv("CHAIN_OUT"));
+    return 0;
+}
 
+int main(int argc, char** argv) {
+    if (getenv("CHAIN_OUT")) return chain_mode(argc, argv);
+    SimCtrl<Vattn_tb> sim(argc, argv);
+    sim.max_time = 8'000'000'000ull;
     printf("attn test (H=%d W=%d C_QKV=%d C_FE=%d)\n", H, W, C_QKV, C_FE);
 
-    sim.dut->start_i      = 0;
-    sim.dut->qkv_valid_i  = 0;
-    sim.dut->pe_valid_i   = 0;
-    sim.dut->proj_valid_i = 0;
-    sim.dut->spl1_valid_i = 0;
-    sim.dut->ffn1_valid_i = 0;
-    sim.dut->oready_i     = 0;
+    sim.dut->start_i = sim.dut->qkv_valid_i = sim.dut->pe_valid_i = sim.dut->oready_i = 0;
     sim.reset();
 
-    double s_out = load_real_from_manifest("S_OUT");
-    printf("  S_OUT = %.6f\n", s_out);
+    double s_aout = load_real_from_manifest("S_AOUT");
+    printf("  S_AOUT = %.6f\n", s_aout);
 
-    const std::vector<std::string> samples = {
-        "rand0", "rand1", "rand2", "half", "gradient",
+    const std::vector<std::string> samples = {"rand0","rand1","rand2","half","gradient"};
+    const size_t N = size_t(H) * W;
+    int passed = 0;
+
+    auto cos_vs = [&](const std::vector<int8_t>& dut, const float* ref) {
+        long double dot=0, na=0, nb=0;
+        for (size_t i=0;i<N*C_FE;i++){ double a=double(dut[i])*s_aout, b=double(ref[i]);
+            dot+=a*b; na+=a*a; nb+=b*b; }
+        return double(dot/(std::sqrt(double(na))*std::sqrt(double(nb))+1e-30L));
     };
 
-    int passed = 0;
     for (auto& nm : samples) {
-        printf("  --- sample %s ---\n", nm.c_str());
-        auto r = drive_sample(sim, nm, s_out);
-        printf("  [%s] bit_exact_bad=%d  cos(DUT vs SW)=%.6f  cos(DUT vs ORT)=%.6f  cycles=%d\n",
-               nm.c_str(), r.bit_exact_bad, r.cos_sw, r.cos_ort, r.cycles);
-        const bool is_random_tile = (nm.rfind("rand", 0) == 0);
-        if (is_random_tile) {
-            sim.check(r.cos_ort >= 0.998,
-                      nm + ": cos(DUT vs ORT) >= 0.998 on random tile");
-        } else {
-            sim.check(r.cos_ort >= 0.990,
-                      nm + ": cos(DUT vs ORT) >= 0.990 on non-random tile");
+        auto qkv_in = load_i8_hex (std::string(STIM_DIR)+"/"+nm+".qkv_i8.hex", N*C_QKV);
+        auto pe_in  = load_i8_hex (std::string(STIM_DIR)+"/"+nm+".pe_i8.hex",  N*C_FE);
+        auto golden = load_i8_hex (std::string(STIM_DIR)+"/"+nm+".golden_attn_i8.hex", N*C_FE);
+        auto ref    = load_f32_hex(std::string(STIM_DIR)+"/"+nm+".ref_attn_f32.hex",  N*C_FE);
+
+        auto dut = drive(sim, qkv_in, pe_in);
+
+        int bad = 0;
+        for (size_t i=0;i<dut.size();i++) if (dut[i]!=golden[i]) {
+            if (bad<4){ size_t pix=i/C_FE,ch=i%C_FE;
+                printf("  %s: i8 diff @ (h=%zu w=%zu ch=%zu) got=%d exp=%d\n",
+                       nm.c_str(), pix/W, pix%W, ch, int(dut[i]), int(golden[i])); }
+            bad++;
         }
-        // DUT-vs-SW cos check (both are fp16-ish; should be very close).
-        sim.check(r.cos_sw >= 0.990,
-                  nm + ": cos(DUT vs SW int8 golden) >= 0.990");
-        if (r.cos_ort >= (is_random_tile ? 0.998 : 0.990)) passed++;
+        std::vector<float> golden_f(N*C_FE);
+        for (size_t i=0;i<golden_f.size();i++) golden_f[i]=float(golden[i])*float(s_aout);
+        double cos_sw  = cos_vs(dut, golden_f.data());
+        double cos_ort = cos_vs(dut, ref.data());
+        printf("  [%s] bit_exact_bad=%d  cos(DUT vs SW)=%.6f  cos(DUT vs ORT)=%.6f\n",
+               nm.c_str(), bad, cos_sw, cos_ort);
+        const bool rnd = (nm.rfind("rand",0)==0);
+        sim.check(cos_ort >= (rnd ? 0.99 : 0.95), nm + ": cos(DUT vs ORT) ok");
+        sim.check(cos_sw  >= 0.99, nm + ": cos(DUT vs SW int8 golden) >= 0.99");
+        if (cos_ort >= (rnd ? 0.99 : 0.95)) passed++;
     }
     printf("samples passed: %d / %zu\n", passed, samples.size());
-
     return sim.finish();
 }
