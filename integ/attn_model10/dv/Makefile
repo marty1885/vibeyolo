@@ -5,6 +5,7 @@ endif
 
 S_DIR    := $(REPO_ROOT)/integ/attn_model10/rtl
 STIM_DIR := $(REPO_ROOT)/integ/attn_model10/stim
+IP_DIR   := $(REPO_ROOT)/hw/ip
 
 TB_TOP := attn_tb
 
@@ -12,12 +13,18 @@ TB_TOP := attn_tb
 # attn_tb.sv on the verilator command line (handled via RTL_SRCS order).
 RTL_SRCS := \
   $(STIM_DIR)/attn_scales_pkg.sv \
+  $(IP_DIR)/mac8/rtl/mac8.sv \
+  $(IP_DIR)/dotN/rtl/dotN.sv \
+  $(IP_DIR)/i32_to_fp16/rtl/i32_to_fp16.sv \
+  $(IP_DIR)/fp16_fma/rtl/fp16_fma.sv \
+  $(IP_DIR)/fp16_to_i8_sat/rtl/fp16_to_i8_sat.sv \
+  $(IP_DIR)/flash_attn/rtl/flash_attn.sv \
   $(S_DIR)/attn.sv \
   $(CURDIR)/attn_tb.sv
 
 CC_SRCS := $(CURDIR)/attn_test.cc
 
-LINT_FLAGS := -Wno-UNOPTFLAT -Wno-ASCRANGE -Wno-SELRANGE -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-REALCVT -Wno-BLKSEQ
+LINT_FLAGS := -Wno-UNOPTFLAT -Wno-ASCRANGE -Wno-SELRANGE -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-REALCVT -Wno-BLKSEQ -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL -Wno-IMPLICITSTATIC -Wno-WIDTHCONCAT -Wno-LATCH -Wno-ENUMVALUE
 VERILATOR_THREADS ?= 1
 
 include $(REPO_ROOT)/mk/verilator.mk

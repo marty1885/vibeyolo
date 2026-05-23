@@ -59,15 +59,11 @@ module attn_tb #(
   output logic                              done_o
 );
 
+  // Structural shim pulls fp16 bits directly from attn_scales_pkg via
+  // `import` inside attn.sv; no scale parameters needed on the instance.
   attn #(
     .H(H), .W(W), .C_QKV(C_QKV), .C_FE(C_FE),
-    .HEADS(HEADS), .DIM_Q(DIM_Q), .DIM_K(DIM_K), .DIM_V(DIM_V),
-    .S_QKV (attn_scales_pkg::PARAM_S_QKV),
-    .S_PE  (attn_scales_pkg::PARAM_S_PE),
-    .S_PROJ(attn_scales_pkg::PARAM_S_PROJ),
-    .S_SPL1(attn_scales_pkg::PARAM_S_SPL1),
-    .S_FFN1(attn_scales_pkg::PARAM_S_FFN1),
-    .S_OUT (attn_scales_pkg::PARAM_S_OUT)
+    .HEADS(HEADS), .DIM_Q(DIM_Q), .DIM_K(DIM_K), .DIM_V(DIM_V)
   ) u_dut (
     .clk_i        (clk_i),
     .rst_ni       (rst_ni),

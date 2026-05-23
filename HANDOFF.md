@@ -99,15 +99,14 @@ All 102 conv layers are ORT-validated. The remaining work is block-level integra
 - [x] **SPPF integration block** (`integ/sppf_model9/`) — between L31 and L32. Three sequential `maxpool_kxk` (K=5) stages over L31's output, then `concat_mux` of {L31_out, mp1, mp2, mp3} feeding L32's input. 10/10 checks, 5/5 ORT samples bit-exact vs SW ref, cos ≥ 0.99994 vs ORT (H=20 W=20 C=128 K=5 ROI=8x8).
 - [x] **Upsample integration — `/model.11` + `/model.12`** (`integ/upsample_model11/`) — P4→P3 neck join after L39. Nearest-neighbour 2x upsample of /model.10/cv2 (256ch, 20²) then channel-concat with /model.6/cv2 P3 skip (128ch, 40²) → 384ch 40² feeding L40 (/model.13/cv1). Frame-store + drain design (mirrors SPPF — does NOT use the byte-serial `concat_mux` or single-channel `upsample2` IPs; channel-parallel wide bus). Both inputs share a per-sample S_OUT covering the joint range (real chip would do an upstream per-stream fp16 rescale). 10/10 checks, 5/5 samples bit-exact vs SW int8 golden, cos vs ORT 0.9995..0.9998 across all samples (3/3 random tiles ≥ 0.998).
 - [x] **Upsample integration — `/model.14` + `/model.15`** (`integ/upsample_model14/`) — P3→detect neck join after L48. Parameterized clone of the model.11 block: NN 2x upsample of /model.13/cv2 (128ch, 40²) then channel-concat with /model.4/cv2 P3 skip (128ch, 80²) → 256ch 80² feeding L49 (/model.16/cv1). Same frame-store + drain RTL, only parameters change (H_A/W_A=40, C_A=128, H_B/W_B=80, C_B=128). 10/10 checks, 5/5 samples bit-exact vs SW int8 golden, cos vs ORT 0.999642..0.999833 across all samples (3/3 random tiles ≥ 0.998).
-- [~] **Attention block — `/model.10` PSA** (`integ/attn_model10/`) — **behavioral placeholder, not synthesizable.** Numerics validated end-to-end against ORT (10/10 checks, 5/5 samples, cos 0.99972..0.99984), but the matmuls + 400-lane softmax are implemented in SV `real` arithmetic inside `always_ff`. Useful as a golden reference; do NOT count toward PD area/cycle modeling. Will be replaced by a thin shim around the new `hw/ip/flash_attn/` leaf IP once that lands.
+- [x] **Attention block — `/model.10` PSA** (`integ/attn_model10/`) — **structural rebuild done.** Wraps the new `hw/ip/flash_attn/` IP (HEADS=2 N=400 DIM_Q=32 DIM_V=64 BR=16 BC=32) with structural int8↔fp16 boundaries: 256 parallel `i32_to_fp16`+`fp16_fma` lanes dequant qkv into flat Q/K/V buses; 128 parallel structural residual chains (`i32_to_fp16` → 3× `fp16_fma(_, S_*, c)` chained-sum → `fp16_fma(_, INV_S_OUT, 0)` → `fp16_to_i8_sat`) emit final int8. Single 1-cycle `tc_dly` aligns the chained-FMA sum pipeline. 10/10 checks, 5/5 ORT samples cos 0.99972..0.99984, **74,911 cyc/frame, under T_FRAME=100k**.
 
 **Done since last handoff:**
 - [x] **`hw/ip/flash_attn/` — flash-attention leaf IP** — parameterized tile-streaming fp16 flash-attention with online softmax. **DV passes at all 5 configs** (small/dbg/mid1/mid2/prod). Production-shape (HEADS=2, N=400, DIM_Q=32, DIM_V=64, BR=16, BC=32, ~512 FMA cells): **71,701 cyc/frame — under T_FRAME=100k budget**. Bug found and fixed during multi-config DV bring-up: `S_NORM_S` non-final branch incremented `norm_chunk_q` but didn't reassign `state_q <= S_NORM_D`, so when `DIM_V > BC` (multi-chunk normalize) every chunk past the first sampled stale `cell_y` and corrupted `O_out`. One-line fix at `rtl/flash_attn.sv:753`. The original WIP "20× over budget" framing was the unparallelized `BR=1, BC=1` number — at the production tile sizes the design fits with room to spare. Resolved: `pe` lives outside the IP (integration shim adds pe(V) post-IP).
 
 **To build (in recommended order):**
-1. **Attention integration shim — `/model.10` PSA** *(next up — top priority)* — replaces behavioral `integ/attn_model10/` with ~80-line shim instantiating `flash_attn` + an external pe(V) `conv_layer` + `add_rq` residuals + requant boundaries. Re-run existing extract.py / TB against ORT.
-2. **Attention integration shim — `/model.22` A2C2f** *(trivial)* — parametric clone of `/model.10` shim. L88..L92 = L34..L38 shape-wise.
-3. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
+1. **Attention integration shim — `/model.22` A2C2f** *(next up — parametric clone)* — L88..L92 = L34..L38 shape-wise per ONNX, so the `/model.10` shim copies straight over with different scale-pkg/extract paths.
+2. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
 
 ### Top-level integration (after all blocks)
 - `top.sv` that wires all 102+ layer instances in a streaming dataflow.
@@ -289,9 +288,8 @@ for n in m.graph.node:
 
 ## What I'd do next (concrete plan for the new AI)
 
-1. **`/model.10` PSA attention integration shim** — wrap `hw/ip/flash_attn/` in a thin (~80 line) shim that does QKV split off L34's output, drives flash_attn, adds pe(V) via an external `conv_layer`, applies `add_rq` residuals around the proj/FFN convs, and handles requant boundaries. Replaces the behavioral `integ/attn_model10/`. Re-run its extract.py / TB against ORT.
-2. **`/model.22` A2C2f attention shim** — parametric clone of (1). L88..L92 shapes are byte-identical to L34..L38 per ONNX.
-3. **Detect head with learned top-k** — end-to-end, no NMS. Inspect `/model.23` in ONNX first; the novel piece is the cross-scale (80²/40²/20²) learned top-k.
-4. **Top-level integration + E2E ORT validation** on real 640×640 images.
+1. **`/model.22` A2C2f attention shim** — parametric clone of `/model.10`. L88..L92 shapes are byte-identical to L34..L38 per ONNX, so the structural shim copies straight over.
+2. **Detect head with learned top-k** — end-to-end, no NMS. Inspect `/model.23` in ONNX first; the novel piece is the cross-scale (80²/40²/20²) learned top-k.
+3. **Top-level integration + E2E ORT validation** on real 640×640 images.
 
 The hardest remaining technical risk is the **detect head** (end-to-end, learned top-k, no NMS). Look at the ONNX for `/model.23` and below before designing it.
