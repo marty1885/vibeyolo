@@ -105,8 +105,11 @@ All 102 conv layers are ORT-validated. The remaining work is block-level integra
 **Done since last handoff:**
 - [x] **`hw/ip/flash_attn/` — flash-attention leaf IP** — parameterized tile-streaming fp16 flash-attention with online softmax. **DV passes at all 5 configs** (small/dbg/mid1/mid2/prod). Production-shape (HEADS=2, N=400, DIM_Q=32, DIM_V=64, BR=16, BC=32, ~512 FMA cells): **71,701 cyc/frame — under T_FRAME=100k budget**. Bug found and fixed during multi-config DV bring-up: `S_NORM_S` non-final branch incremented `norm_chunk_q` but didn't reassign `state_q <= S_NORM_D`, so when `DIM_V > BC` (multi-chunk normalize) every chunk past the first sampled stale `cell_y` and corrupted `O_out`. One-line fix at `rtl/flash_attn.sv:753`. The original WIP "20× over budget" framing was the unparallelized `BR=1, BC=1` number — at the production tile sizes the design fits with room to spare. Resolved: `pe` lives outside the IP (integration shim adds pe(V) post-IP).
 
+**Done since last handoff:**
+- [x] **Detect head with learned top-k** (`integ/detect_model23/`) — end-to-end, no NMS. **DV 7/7.** Key findings: this export has **no DFL** (box `cv2.x.2` regresses 4 ltrb directly — so `box_decode`/DFL is *unused*) and **no sigmoid** in HW (graph output is raw logits; topk on logits is monotone-equivalent). anchor `(col+.5,row+.5)`/stride `{8,16,32}` are counter-derived (no ROM). Composition decode→topk→gather with score stored to SRAM and fed to `topk_fp16` at its `in_ready` rate (random-access read avoids any backpressure FIFO). New verified leaves: `reduce_max_n`, `box_affine`, `dequant_n`. DV is staged vs an int8 reference (set exact + logits bit-exact + boxes ULP); see footgun below. Budget worst-case ~84.7k < 100k.
+
 **To build (in recommended order):**
-1. **Detect head with learned top-k** *(hardest)* — YOLO26 is end-to-end (no NMS). `box_decode` validated; novel work is the learned top-k selection across three scales (80², 40², 20²). Largest remaining technical risk.
+1. ~~Detect head~~ — DONE (above).
 
 ### Top-level integration (after all blocks)
 - `top.sv` that wires all 102+ layer instances in a streaming dataflow.
@@ -242,6 +245,14 @@ mkdir integ/layer_N_<short>/{rtl,dv,stim}
 - The model.10 attention block (`integ/attn_model10/`) implements the 400-lane softmax locally in its DUT — same algorithm shape as `softmax16` (row max, per-lane `exp(x − max)`, sum, reciprocal, multiply) but in behavioral `real` arithmetic with RNE-round-to-fp16 after every op (matching `softmax16_ref.sv`'s semantics). The `softmax16` leaf IP is left untouched.
 - Reusable: `tools/layergen` could grow a `softmax_n` skeleton parameterized over N if more attention sites of differing N pop up in YOLO27/etc.
 
+### 14. Detect-head end-to-end vs ORT is misleading on object-free inputs
+- The head ends in `TopK(300 of 8400)`. On random/synthetic inputs there are no real objects, so all scores cluster low and the 300th↔301st gap is ~0.25 of one int8 LSB. int8 score quant then reshuffles ~12-18 boundary anchors, and `pred_boxes`-vs-ORT cosine collapses to ~0.6 even when the hardware is correct.
+- **Gate the DUT on the int8 reference** (`integ/detect_model23/extract.py` `sw_int8_head`): selected anchor SET exact + gathered logits bit-exact + boxes within fp16 ULP. ORT only sanities the selection-STABLE stages (decoded boxes, score). Defer end-to-end pred_boxes-vs-ORT to real-image E2E. Box-decode is fp16 (ULP tol, cancellation-aware `8*step(pmax)`); reduce_max/topk/gather are integer-exact.
+- For DUT/ref topk selection to match bit-exactly, the reference must dequant with `fp16(scale)` (mirror the hardware), not the float32 scale — otherwise the ~1 ULP score delta reshuffles the tie cluster.
+
+### 15. Packed-concat element order vs C++ byte read
+- `logic [3:0][15:0] x; x <= {cx,cy,w,h};` puts `cx` in the **MSB** → `x[3]=cx, x[0]=h`. A C++ `reinterpret_cast<uint16_t*>(&port)[0]` reads the **LSB** = `h`. Mismatch silently compared `h` against `cx` (≈all boxes "wrong"). Emit `{h,w,cy,cx}` so element 0 = cx, or read reversed. Per-lane arrays (e.g. logits `y_o[i]`) are unaffected — only concatenations reverse.
+
 ### 12. mk/verilator.mk LINT_FLAGS reached lint only, not build
 - Layer Makefiles setting `LINT_FLAGS = -Wno-SELRANGE -Wno-ASCRANGE` saw waivers honored at `make lint` but ignored at `make test`. Build failed `-Wall` on legitimate edge cases (any layer with `P_COUT=1` — depthwise + detect-head `cv2.x.2` nosilu tails).
 - Fixed by passing `$(LINT_FLAGS)` to the build verilator invocation too.
@@ -288,7 +299,18 @@ for n in m.graph.node:
 
 ## What I'd do next (concrete plan for the new AI)
 
-1. **Detect head with learned top-k** — end-to-end, no NMS. Inspect `/model.23` in ONNX first; the novel piece is the cross-scale (80²/40²/20²) learned top-k.
-2. **Top-level integration + E2E ORT validation** on real 640×640 images.
+All conv layers AND all block-level IPs (SPPF, both upsamples, both attention
+blocks, detect head) are now done and DV-passing. The remaining work is
+**top-level integration**:
 
-The hardest remaining technical risk is the **detect head** (end-to-end, learned top-k, no NMS). Look at the ONNX for `/model.23` and below before designing it.
+1. **`top.sv`** — wire all 102 conv layers + SPPF + upsamples + attention +
+   detect head into one streaming dataflow. Note: a single Verilator design of
+   all 102 layers is NOT feasible (footgun #4); plan E2E as a C++/`_ref.sv`
+   chain, not one monolithic elaboration.
+2. **Skip-connection FIFOs** — P3 = 80×80×64 ≈ 410 KB, P4 = 40×40×128 ≈ 205 KB.
+   Plus the detect head's behavioral SRAMs (logits 672 KB, boxes 67 KB, score
+   16.8 KB) now join the macro list in `MEMORIES.md`.
+3. **Real-image E2E ORT validation** — push a real 640×640 image through the
+   whole DUT; compare detect output vs ORT (target cos ≥ 0.99). This is also
+   where the detect-head's end-to-end pred_boxes-vs-ORT becomes meaningful
+   (real images have separated detections; see footgun #14).
