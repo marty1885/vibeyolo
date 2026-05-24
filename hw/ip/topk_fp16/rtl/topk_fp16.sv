@@ -111,6 +111,28 @@ module topk_fp16 #(
   logic [15:0]      heap_val_q [K];
   logic [IDX_W-1:0] heap_idx_q [K];
 
+  // ── heap-navigation helpers (read the registered heap) ──
+  // Used by the two-levels-per-cycle sift-down. `has_child` is true when the
+  // left child of slot p exists (the heap is complete, so no left ⇒ no right).
+  // `min_child` returns the smaller-valued child slot.
+  function automatic logic has_child(input logic [HIDX_W-1:0] p);
+    logic [HIDX_W:0] l;
+    l = {1'b0, p} + {1'b0, p} + (HIDX_W+1)'(1);
+    return (l < (HIDX_W+1)'(K));
+  endfunction
+
+  function automatic logic [HIDX_W-1:0] min_child(input logic [HIDX_W-1:0] p);
+    logic [HIDX_W:0] l, r;
+    logic            has_r;
+    l     = {1'b0, p} + {1'b0, p} + (HIDX_W+1)'(1);
+    r     = l + (HIDX_W+1)'(1);
+    has_r = (r < (HIDX_W+1)'(K));
+    if (has_r && fp16_lt(heap_val_q[r[HIDX_W-1:0]], heap_val_q[l[HIDX_W-1:0]]))
+      min_child = r[HIDX_W-1:0];
+    else
+      min_child = l[HIDX_W-1:0];
+  endfunction
+
   // ───────────────────────── FSM ─────────────────────────────────
 
   typedef enum logic [2:0] {
@@ -143,10 +165,7 @@ module topk_fp16 #(
   // ── next-state logic ──
   always_comb begin
     automatic logic [HIDX_W-1:0] par_idx;
-    automatic logic [HIDX_W:0]   l_w, r_w;   // wider so 2*cur+2 fits
-    automatic logic [HIDX_W-1:0] l_idx, r_idx;
-    automatic logic              has_l, has_r;
-    automatic logic [HIDX_W-1:0] smaller_child;
+    automatic logic [HIDX_W-1:0] sc1, sc2;   // first/second-level smaller child
 
     state_d    = state_q;
     count_d    = count_q;
@@ -155,14 +174,9 @@ module topk_fp16 #(
     pend_val_d = pend_val_q;
     pend_idx_d = pend_idx_q;
 
-    par_idx       = '0;
-    l_w           = '0;
-    r_w           = '0;
-    l_idx         = '0;
-    r_idx         = '0;
-    has_l         = 1'b0;
-    has_r         = 1'b0;
-    smaller_child = '0;
+    par_idx = '0;
+    sc1     = '0;
+    sc2     = '0;
 
     case (state_q)
       S_IDLE: begin
@@ -206,26 +220,30 @@ module topk_fp16 #(
       end
 
       S_SIFT_DOWN: begin
-        l_w   = {1'b0, cur_q} + {1'b0, cur_q} + (HIDX_W+1)'(1);
-        r_w   = l_w + (HIDX_W+1)'(1);
-        has_l = (l_w < (HIDX_W+1)'(K));
-        has_r = (r_w < (HIDX_W+1)'(K));
-        l_idx = l_w[HIDX_W-1:0];
-        r_idx = r_w[HIDX_W-1:0];
-
-        if (!has_l) begin
+        // Descend up to two heap levels this cycle. The value being sifted
+        // is V = heap[cur_q]. Level 1: smaller child sc1; if V <= heap[sc1]
+        // it has settled. Level 2: from sc1, smaller child sc2; if heap[sc2]
+        // < V, V moves two levels (→ sc2) and we keep sifting; otherwise V
+        // settles at sc1.
+        if (!has_child(cur_q)) begin
           state_d = (count_q == CNT_W'(N)) ? S_DONE : S_ACCEPT;
         end else begin
-          if (has_r && fp16_lt(heap_val_q[r_idx], heap_val_q[l_idx])) begin
-            smaller_child = r_idx;
-          end else begin
-            smaller_child = l_idx;
-          end
-          if (fp16_lt(heap_val_q[smaller_child], heap_val_q[cur_q])) begin
-            cur_d   = smaller_child;
-            state_d = S_SIFT_DOWN;
-          end else begin
+          sc1 = min_child(cur_q);
+          if (!fp16_lt(heap_val_q[sc1], heap_val_q[cur_q])) begin
             state_d = (count_q == CNT_W'(N)) ? S_DONE : S_ACCEPT;
+          end else if (!has_child(sc1)) begin
+            // sc1 is a leaf: one-level swap, then settled.
+            cur_d   = sc1;
+            state_d = (count_q == CNT_W'(N)) ? S_DONE : S_ACCEPT;
+          end else begin
+            sc2 = min_child(sc1);
+            if (fp16_lt(heap_val_q[sc2], heap_val_q[cur_q])) begin
+              cur_d   = sc2;
+              state_d = S_SIFT_DOWN;
+            end else begin
+              cur_d   = sc1;
+              state_d = (count_q == CNT_W'(N)) ? S_DONE : S_ACCEPT;
+            end
           end
         end
       end
@@ -241,10 +259,7 @@ module topk_fp16 #(
   // ── sequential heap update ──
   always_ff @(posedge clk_i or negedge rst_ni) begin
     automatic logic [HIDX_W-1:0] par_idx;
-    automatic logic [HIDX_W:0]   l_w, r_w;
-    automatic logic [HIDX_W-1:0] l_idx, r_idx;
-    automatic logic              has_l, has_r;
-    automatic logic [HIDX_W-1:0] smaller_child;
+    automatic logic [HIDX_W-1:0] sc1, sc2;   // first/second-level smaller child
     automatic logic [15:0]       tmp_v;
     automatic logic [IDX_W-1:0]  tmp_x;
 
@@ -302,25 +317,39 @@ module topk_fp16 #(
         end
 
         S_SIFT_DOWN: begin
-          l_w   = {1'b0, cur_q} + {1'b0, cur_q} + (HIDX_W+1)'(1);
-          r_w   = l_w + (HIDX_W+1)'(1);
-          has_l = (l_w < (HIDX_W+1)'(K));
-          has_r = (r_w < (HIDX_W+1)'(K));
-          l_idx = l_w[HIDX_W-1:0];
-          r_idx = r_w[HIDX_W-1:0];
-          if (has_l) begin
-            if (has_r && fp16_lt(heap_val_q[r_idx], heap_val_q[l_idx])) begin
-              smaller_child = r_idx;
-            end else begin
-              smaller_child = l_idx;
-            end
-            if (fp16_lt(heap_val_q[smaller_child], heap_val_q[cur_q])) begin
+          // Mirror the next-state logic: rotate V = heap[cur_q] down up to two
+          // levels in one cycle. cur/sc1/sc2 are parent/child/grandchild, hence
+          // distinct, so the multi-cell write never aliases. RHS reads are the
+          // old (registered) values.
+          if (has_child(cur_q)) begin
+            sc1 = min_child(cur_q);
+            if (fp16_lt(heap_val_q[sc1], heap_val_q[cur_q])) begin
               tmp_v = heap_val_q[cur_q];
               tmp_x = heap_idx_q[cur_q];
-              heap_val_q[cur_q]         <= heap_val_q[smaller_child];
-              heap_idx_q[cur_q]         <= heap_idx_q[smaller_child];
-              heap_val_q[smaller_child] <= tmp_v;
-              heap_idx_q[smaller_child] <= tmp_x;
+              if (!has_child(sc1)) begin
+                // one-level swap (sc1 is a leaf)
+                heap_val_q[cur_q] <= heap_val_q[sc1];
+                heap_idx_q[cur_q] <= heap_idx_q[sc1];
+                heap_val_q[sc1]   <= tmp_v;
+                heap_idx_q[sc1]   <= tmp_x;
+              end else begin
+                sc2 = min_child(sc1);
+                if (fp16_lt(heap_val_q[sc2], heap_val_q[cur_q])) begin
+                  // two-level rotate: cur←sc1, sc1←sc2, sc2←V
+                  heap_val_q[cur_q] <= heap_val_q[sc1];
+                  heap_idx_q[cur_q] <= heap_idx_q[sc1];
+                  heap_val_q[sc1]   <= heap_val_q[sc2];
+                  heap_idx_q[sc1]   <= heap_idx_q[sc2];
+                  heap_val_q[sc2]   <= tmp_v;
+                  heap_idx_q[sc2]   <= tmp_x;
+                end else begin
+                  // one-level swap (V settles at sc1)
+                  heap_val_q[cur_q] <= heap_val_q[sc1];
+                  heap_idx_q[cur_q] <= heap_idx_q[sc1];
+                  heap_val_q[sc1]   <= tmp_v;
+                  heap_idx_q[sc1]   <= tmp_x;
+                end
+              end
             end
           end
         end

@@ -352,12 +352,13 @@ static void run_tests(SimCtrl<DUT>& sim, int N, int K, int IDX_W,
     }
 
     // ── Worst-case bound check ──
-    // Spec: K*9 + (N-K)*10 + slack. Each accepted element costs ≤ 1 cycle
-    // accept + ≤ ceil(log2(K)) cycles sift. For the implementation we use,
-    // worst-case per element ≤ 1 + ceil(log2(K)) ≈ 10 for K=300.
+    // Each accepted element costs ≤ 1 cycle accept + the sift cost. Sift-down
+    // descends TWO heap levels per cycle, so the sift cost is
+    // ≤ ceil(ceil(log2(K)) / 2). For K=300, log2K=9 ⇒ ≤ 1 + 5 = 6 cyc/elem.
     int log2K = 0;
     while ((1 << log2K) < K) log2K++;
-    uint64_t bound = (uint64_t)N * (uint64_t)(1 + log2K) + 200;
+    int sift_cyc = (log2K + 1) / 2;                 // two levels per cycle
+    uint64_t bound = (uint64_t)N * (uint64_t)(1 + sift_cyc) + 200;
     sim.check(worst_cycles_out <= bound,
               std::string(tag) + ": worst-case cycles within bound (got "
               + std::to_string(worst_cycles_out) + " <= "

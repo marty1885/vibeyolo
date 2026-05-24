@@ -35,6 +35,16 @@ integ/generated/scale_experiments/
 # Large intermediate ONNX files (re-derivable)
 **/_model_with_intermediate.onnx
 
+# E2E co-sim Verilator build tree (large, re-derivable from tools/e2e)
+tools/e2e/cosim/build/
+# E2E generated activations / hex / onnx / npy / report (re-derivable)
+integ/generated/e2e/
+# Derived input tensors (re-derivable from source images)
+assets/*.npy
+# yosys/abc scratch + local scheduler state
+abc.history
+.claude/
+
 # Coverage / lint
 **/coverage/
 **/*.dat

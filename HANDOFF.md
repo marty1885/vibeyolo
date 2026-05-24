@@ -91,7 +91,29 @@ ls -d integ/generated/layer_*/dv | xargs -I{} -P 6 bash -c \
 
 ## What's next
 
-All 102 conv layers are ORT-validated. The remaining work is block-level integration around graph boundaries (SPPF, upsamples, attention, detect head) and then top-level wiring.
+**Latest session (2026-05-23): top-level wiring started + timing signed off.**
+- `hw/ip/conv_stage/` — NEW synthesizable per-layer streaming wrapper (linebuf +
+  on-die weight/scale/bias ROMs + tile-sequencer FSM around `conv_layer`). This
+  was the missing RTL: `conv_layer` alone is a bare compute core sequenced only
+  in C++ DV. **DV bit-exact vs `conv_layer` across 5 configs.** See its README.
+- `TIMING.md` (`tools/throughput.py`) — **II = 84,700 cyc → 11,806 FPS @ 1 GHz,
+  0/102 over T_FRAME → PASS.** Bottleneck = detect head. Latency ≈ 5.94 ms.
+- `integ/generated/core/` (`tools/gen_core.py`) — **structural `yolo26n_core`
+  COMPLETE**: 102 `conv_stage` + C2f/neck glue (slice/concat/residual `add_rq`
+  banks) + 6 blocks (sppf, 2× upsample_concat, 2× attn, detect_head) at graph
+  positions + 4 `skip_buf` banks (m.4/m.6/m.10/m.13 cv2 taps) + detect→top
+  ports. **Lint 0 warnings / 0 errors** (~340 s/14 GB; whole-chip sim infeasible
+  per footgun #4). Glue widths from ONNX shape-inference; m.9 residual
+  (m.9/cv2 + m.8/cv2) wired. Connectivity netlist — per-region handshake timing
+  inherited from the DV'd blocks.
+- `AREA.md` (`tools/area_estimate.py`) — yosys-grounded gate sanity:
+  `mac8` = 634 generic cells × 71,741 physical MACs (real `scale_pkg`) +60%
+  → **~73 M gates ≈ 1.1 % of the 6.5 G half-reticle budget** (~90× headroom).
+
+All 102 conv layers are ORT-validated; the top-level structural netlist now
+composes them with the blocks/glue/skips and lints clean. Remaining work is the
+PD/synth flow (LUT→hex bake, SRAM macro mapping — see synth audit) and, if a
+whole-chip dynamic check is ever wanted, region-partitioned cosim.
 
 ### Block-level IPs
 
