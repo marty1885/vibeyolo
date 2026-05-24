@@ -117,8 +117,9 @@ module detect_head #(
     .valid_o (ba_valid),
     .cx_o(ba_cx), .cy_o(ba_cy), .w_o(ba_w), .h_o(ba_h)
   );
-  // anchor index carried through box_affine's 7-deep pipe for the write addr
-  localparam int BA_LAT = 7;
+  // anchor index carried through box_affine's 18-deep pipe for the write addr
+  // (BA_LAT == box_affine valid_i→valid_o latency, exact, offset 0).
+  localparam int BA_LAT = 18;
   logic [IDX_W-1:0] ba_idx_pipe [BA_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) for (int k=0;k<BA_LAT;k++) ba_idx_pipe[k] <= '0;
@@ -148,8 +149,10 @@ module detect_head #(
     .clk_i, .rst_ni, .en_i(rm_valid), .x_i(rm_max_vec), .scale_i(scls_q[scl_d1]),
     .valid_o(sc_valid), .y_o(sc_y)
   );
-  // anchor index carried through reduce_max(1) + dequant(2) = 3 deep
-  localparam int SC_LAT = 3;
+  // anchor index carried through reduce_max(1) + dequant(5) = 6 deep
+  // (SC_LAT == reduce_max_n latency + dequant_n latency; aligns sc_idx_pipe
+  // with sc_y/sc_valid for the score_mem write address).
+  localparam int SC_LAT = 6;
   logic [IDX_W-1:0] sc_idx_pipe [SC_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) for (int k=0;k<SC_LAT;k++) sc_idx_pipe[k] <= '0;
@@ -214,8 +217,9 @@ module detect_head #(
     .valid_o(gdq_valid),
     .y_o    (gdq_y)
   );
-  // carry box + anchor through dequant's 2-cycle latency for aligned output
-  localparam int G_LAT = 2;
+  // carry box + anchor through dequant's 5-cycle latency for aligned output
+  // (G_LAT == dequant_n en_i→valid_o latency, exact, offset 0).
+  localparam int G_LAT = 5;
   logic [3:0][15:0]  g_box_pipe   [G_LAT];
   logic [IDX_W-1:0]  g_anch_pipe  [G_LAT];
   logic              g_vld_pipe   [G_LAT];

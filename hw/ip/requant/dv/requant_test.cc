@@ -9,8 +9,9 @@
 // The lesson from fp16_fma's test: fp16 FMA alignment can need ~76 bits;
 // fp32 is not enough. We use __int128 everywhere the magnitude lives.
 //
-// Pipeline latency: 3 cycles (cvt + fma + sat). We push a triple into the
-// pipe, then sample valid_o + y_o 3 cycles later.
+// Pipeline latency: 7 cycles — i32_to_fp16(2) + scale-bump(1) + fp16_fma(3)
+// + fp16_to_i8_sat(1). We push a triple into the pipe, then sample valid_o
+// + y_o LATENCY cycles later (queue-aligned below).
 
 #include <cstdint>
 #include <cstdio>
@@ -25,7 +26,7 @@
 
 using DUT = Vrequant_tb;
 
-static constexpr int LATENCY = 4;
+static constexpr int LATENCY = 7;
 
 // ─── int32 → (fp16, shift) with auto-prescale ───────────────
 struct CvtOut { uint16_t fp16; uint8_t shift; };
@@ -537,25 +538,27 @@ int main(int argc, char** argv) {
     sim.check(sim.dut->valid_dut_o == 0, "valid_o low when no valid_i");
     sim.check(sim.dut->valid_ref_o == 0, "ref valid_o low when no valid_i");
 
-    // Pulse valid_i high for one tick. The 4-deep shift register puts the
-    // 1-bit at valid_sr[0] after the pulse-tick, [1] after the next, …,
-    // and [3]=output 3 additional ticks after the pulse-tick (total 4
-    // ticks counting the pulse itself).
+    // Pulse valid_i high for one tick. The LATENCY-deep shift register
+    // carries the bit so valid_o asserts exactly LATENCY ticks after the
+    // pulse-tick (counting the pulse-tick itself).
     sim.dut->valid_i = 1;
     sim.dut->acc_i   = 100;
     sim.dut->scale_fp16_i = 0x3C00; // 1.0
     sim.dut->bias_fp16_i  = 0x0000;
-    sim.tick();                          // tick A: valid_sr = 0001
+    sim.tick();                          // pulse-tick: valid enters stage 0
     sim.dut->valid_i = 0;
     sim.dut->acc_i   = 0;
-    sim.check(sim.dut->valid_dut_o == 0, "valid_o low immediately after pulse-tick");
-    sim.tick();                          // tick B: valid_sr = 0010
-    sim.check(sim.dut->valid_dut_o == 0, "valid_o still low 1 tick after pulse");
-    sim.tick();                          // tick C: valid_sr = 0100
-    sim.check(sim.dut->valid_dut_o == 0, "valid_o still low 2 ticks after pulse");
-    sim.tick();                          // tick D: valid_sr = 1000 → output high
-    sim.check(sim.dut->valid_dut_o == 1, "valid_o high 3 ticks after pulse");
-    sim.check(sim.dut->valid_ref_o == 1, "ref valid_o high 3 ticks after pulse");
+    // valid_o must stay low for LATENCY-1 ticks after the pulse-tick…
+    for (int i = 0; i < LATENCY - 1; i++) {
+        sim.check(sim.dut->valid_dut_o == 0,
+                  "valid_o low " + std::to_string(i) + " ticks after pulse");
+        sim.tick();
+    }
+    // …and assert on the LATENCY-th tick.
+    sim.check(sim.dut->valid_dut_o == 1,
+              "valid_o high LATENCY ticks after pulse");
+    sim.check(sim.dut->valid_ref_o == 1,
+              "ref valid_o high LATENCY ticks after pulse");
     sim.check((int8_t)sim.dut->y_dut_o == 100, "y_o == 100 for 100*1+0");
 
     // ─── Test 6: mid-stream reset ───────────────────────

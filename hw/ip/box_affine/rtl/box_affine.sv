@@ -22,9 +22,18 @@
 // are converted with i32_to_fp16; the head's FSM derives them from the
 // streaming anchor counter (no ROM).
 //
-// LATENCY = 7 cycles from valid_i to valid_o. Throughput 1 anchor/cycle.
+// LATENCY = 18 cycles from valid_i to valid_o. Throughput 1 anchor/cycle.
+//   1 (S0 input reg) + I2F_LAT (S1 i32→fp16) + 5*FMA_LAT (S2..S6 fma chain)
+//   = 1 + 2 + 5*3 = 18.
 // fp16 arithmetic ⇒ validated to a fp16-ULP tolerance (see DV), not bit-
 // exact; the integer stages of the head (reduce_max/topk/gather) are exact.
+//
+// The shared leaf IPs i32_to_fp16 / fp16_fma are pipelined (latencies in
+// fp16_lat_pkg, the canonical source of truth). To avoid forcing that
+// package into every generated build list this block mirrors the values in
+// local localparams below; the lockstep DV against box_affine_ref fails if
+// they ever drift. Every inter-stage carry register is sized from these so
+// bypassed signals re-align with their parallel compute stage's output.
 
 module box_affine (
   input  logic               clk_i,
@@ -54,13 +63,19 @@ module box_affine (
   localparam logic [15:0] FP16_INV640  = 16'h1666;  //  1/640
   localparam logic [15:0] FP16_INV1280 = 16'h1266;  //  1/1280
 
-  // ─────────────── valid pipeline (7 stages) ───────────────
-  logic [6:0] vq;
+  // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated.
+  localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
+  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  // valid_i → valid_o total latency: S0 + i2f + 5 fma stages.
+  localparam int unsigned TOTAL_LAT = 1 + I2F_LAT + 5*FMA_LAT;  // = 18
+
+  // ─────────────── valid pipeline (TOTAL_LAT stages) ───────────────
+  logic [TOTAL_LAT-1:0] vq;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) vq <= 7'b0;
-    else         vq <= {vq[5:0], valid_i};
+    if (!rst_ni) vq <= '0;
+    else         vq <= {vq[TOTAL_LAT-2:0], valid_i};
   end
-  assign valid_o = vq[6];
+  assign valid_o = vq[TOTAL_LAT-1];
 
   // ─────────────── S0: register inputs ───────────────
   logic signed [31:0] l0, t0, r0, b0, col0, row0, stride0;
@@ -88,9 +103,18 @@ module box_affine (
   i32_to_fp16 u_col (.clk_i, .rst_ni, .x_i(col0),   .y_o(col_f1),   .shift_o(us4));
   i32_to_fp16 u_row (.clk_i, .rst_ni, .x_i(row0),   .y_o(row_f1),   .shift_o(us5));
   i32_to_fp16 u_st  (.clk_i, .rst_ni, .x_i(stride0),.y_o(stride_f1),.shift_o(us6));
+  // sbox is carried PAST the i32_to_fp16 stage → delayed by I2F_LAT so it
+  // re-aligns with l_f1..b_f1 at the S2 fma's b input.
+  logic [15:0] sbox_dl [I2F_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) sbox1 <= 16'h0; else sbox1 <= sbox0;
+    if (!rst_ni) begin
+      for (int i = 0; i < I2F_LAT; i++) sbox_dl[i] <= 16'h0;
+    end else begin
+      sbox_dl[0] <= sbox0;
+      for (int i = 1; i < I2F_LAT; i++) sbox_dl[i] <= sbox_dl[i-1];
+    end
   end
+  assign sbox1 = sbox_dl[I2F_LAT-1];
 
   // ─────────────── S2: dequant d = ltrb_f * S_box; half = 0.5*stride ───────────────
   logic [15:0] dl2, dt2, dr2, db2, half2;
@@ -100,19 +124,58 @@ module box_affine (
   fp16_fma u_dr   (.clk_i, .rst_ni, .a_i(r_f1), .b_i(sbox1),     .c_i(FP16_ZERO), .y_o(dr2));
   fp16_fma u_db   (.clk_i, .rst_ni, .a_i(b_f1), .b_i(sbox1),     .c_i(FP16_ZERO), .y_o(db2));
   fp16_fma u_half (.clk_i, .rst_ni, .a_i(stride_f1), .b_i(FP16_HALF), .c_i(FP16_ZERO), .y_o(half2));
+  // col_f/row_f/stride_f are carried PAST the S2 fma stage → delayed FMA_LAT
+  // so they re-align with half2 (a fresh S2 fma output) at the S3 fma inputs.
+  logic [15:0] col_f_dl [FMA_LAT], row_f_dl [FMA_LAT], stride_f_dl [FMA_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin col_f2<=16'h0; row_f2<=16'h0; stride_f2<=16'h0; end
-    else begin col_f2<=col_f1; row_f2<=row_f1; stride_f2<=stride_f1; end
+    if (!rst_ni) begin
+      for (int i = 0; i < FMA_LAT; i++) begin
+        col_f_dl[i] <= 16'h0; row_f_dl[i] <= 16'h0; stride_f_dl[i] <= 16'h0;
+      end
+    end else begin
+      col_f_dl[0] <= col_f1; row_f_dl[0] <= row_f1; stride_f_dl[0] <= stride_f1;
+      for (int i = 1; i < FMA_LAT; i++) begin
+        col_f_dl[i] <= col_f_dl[i-1];
+        row_f_dl[i] <= row_f_dl[i-1];
+        stride_f_dl[i] <= stride_f_dl[i-1];
+      end
+    end
   end
+  assign col_f2    = col_f_dl[FMA_LAT-1];
+  assign row_f2    = row_f_dl[FMA_LAT-1];
+  assign stride_f2 = stride_f_dl[FMA_LAT-1];
 
   // ─────────────── S3: cx_center = col*stride + half ───────────────
   logic [15:0] cxc3, cyc3, stride_f3, dl3, dt3, dr3, db3;
   fp16_fma u_cxc (.clk_i, .rst_ni, .a_i(col_f2), .b_i(stride_f2), .c_i(half2), .y_o(cxc3));
   fp16_fma u_cyc (.clk_i, .rst_ni, .a_i(row_f2), .b_i(stride_f2), .c_i(half2), .y_o(cyc3));
+  // stride_f and dl..db are carried PAST the S3 fma stage → delayed FMA_LAT
+  // so they re-align with cxc3/cyc3 (fresh S3 fma outputs) at the S4 fma
+  // inputs. dl2..db2 are S2 fma outputs, so they enter this delay line at the
+  // same cycle as col_f2/stride_f2 fed the S3 fma — all aligned.
+  logic [15:0] stride_f_dl3 [FMA_LAT];
+  logic [15:0] dl_dl [FMA_LAT], dt_dl [FMA_LAT], dr_dl [FMA_LAT], db_dl [FMA_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin stride_f3<=16'h0; dl3<=16'h0; dt3<=16'h0; dr3<=16'h0; db3<=16'h0; end
-    else begin stride_f3<=stride_f2; dl3<=dl2; dt3<=dt2; dr3<=dr2; db3<=db2; end
+    if (!rst_ni) begin
+      for (int i = 0; i < FMA_LAT; i++) begin
+        stride_f_dl3[i] <= 16'h0;
+        dl_dl[i] <= 16'h0; dt_dl[i] <= 16'h0; dr_dl[i] <= 16'h0; db_dl[i] <= 16'h0;
+      end
+    end else begin
+      stride_f_dl3[0] <= stride_f2;
+      dl_dl[0] <= dl2; dt_dl[0] <= dt2; dr_dl[0] <= dr2; db_dl[0] <= db2;
+      for (int i = 1; i < FMA_LAT; i++) begin
+        stride_f_dl3[i] <= stride_f_dl3[i-1];
+        dl_dl[i] <= dl_dl[i-1]; dt_dl[i] <= dt_dl[i-1];
+        dr_dl[i] <= dr_dl[i-1]; db_dl[i] <= db_dl[i-1];
+      end
+    end
   end
+  assign stride_f3 = stride_f_dl3[FMA_LAT-1];
+  assign dl3 = dl_dl[FMA_LAT-1];
+  assign dt3 = dt_dl[FMA_LAT-1];
+  assign dr3 = dr_dl[FMA_LAT-1];
+  assign db3 = db_dl[FMA_LAT-1];
 
   // ─────────────── S4: xyxy = center ± d*stride ───────────────
   logic [15:0] stride_neg3;

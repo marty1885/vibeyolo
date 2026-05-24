@@ -72,8 +72,9 @@ static constexpr int N_SEEDS     = 4;
 static constexpr double S_OUT_PRE  = 4.0 / 127.0;
 static constexpr double S_OUT_SILU = 4.0 / 127.0;
 
-// Pipeline latency: 1 + clog2(N_LANE_TILE) + 1(acc) + 1(rq_in) + 4(requant)
-// + 1 if SILU + 5 if RESIDUAL.
+// Pipeline latency: 1 + clog2(N_LANE_TILE) + 1(acc) + 1(rq_in) + 7(requant)
+// + 1 if SILU + 12 if RESIDUAL.  (requant/add_rq grew after i32_to_fp16 and
+// fp16_fma were pipelined for timing.)
 static int clog2i(int v) { int r = 0; while ((1 << r) < v) r++; return r; }
 
 // ─── fp16 conversion (RNE, finite normal/subnormal path) ──────────
@@ -297,7 +298,8 @@ int main(int argc, char** argv) {
     SimCtrl<DUT> sim(argc, argv);
 
     int DOT_LAT = 1 + clog2i(N_LANE_TILE);
-    int TOTAL_LAT = DOT_LAT + 1 + 1 + 4 + (SILU_EN ? 1 : 0) + (RESIDUAL ? 5 : 0);
+    // requant=7, add_rq=12 after i32_to_fp16/fp16_fma were pipelined.
+    int TOTAL_LAT = DOT_LAT + 1 + 1 + 7 + (SILU_EN ? 1 : 0) + (RESIDUAL ? 12 : 0);
 
     int BEATS_PER_PIX = N_COUT_TILE * N_CIN_TILE;
     int TOTAL_BEATS   = N_OUT * BEATS_PER_PIX;

@@ -38,9 +38,9 @@ static constexpr double S_OUT_SILU = 2.335 / 127.0;
 static constexpr int DOT_LAT     = 5;  // 1 + clog2(9)
 static constexpr int ACC_LAT     = 1;
 static constexpr int RQ_IN_LAT   = 1;
-static constexpr int REQUANT_LAT = 4;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT    = 1;
-static constexpr int ADDRQ_LAT   = 5;
+static constexpr int ADDRQ_LAT   = 12;
 static constexpr int TOTAL_LAT   = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT + ADDRQ_LAT;
 
 static std::string stim_dir() { return std::string("../stim"); }

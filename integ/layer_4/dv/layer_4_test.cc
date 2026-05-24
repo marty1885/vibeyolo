@@ -40,9 +40,9 @@ static constexpr double S_OUT_SILU = 32.0 / 127.0;
 static constexpr int DOT_LAT     = 1 + 7;  // clog2(72)=7
 static constexpr int ACC_LAT     = 1;
 static constexpr int RQ_IN_LAT   = 1;
-static constexpr int REQUANT_LAT = 4;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT    = 1;
-static constexpr int ADD_LAT     = 4;       // add_rq depth (conservative)
+static constexpr int ADD_LAT     = 12;       // add_rq depth (conservative)
 static constexpr int TOTAL_LAT   = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT + ADD_LAT;
 
 static std::string stim_dir() { return std::string("../stim"); }

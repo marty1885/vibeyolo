@@ -18,22 +18,37 @@
 //   x2 = cx_center + d_r*S    via fp16_fma(d_r, +S, cx_center)
 // Likewise for y1, y2.
 //
-// Pipeline (each "S<n>" stage = 1 register-to-register hop):
+// Pipeline. The two shared leaf IPs are pipelined: i32_to_fp16 takes
+// I2F_LAT cycles and fp16_fma takes FMA_LAT cycles (mirrored from
+// fp16_lat_pkg in the localparams below). The two parallel datapaths have
+// different depths and must meet cycle-aligned at the final fmas, so every
+// value carried *past* a compute stage is delayed by a shift-register whose
+// depth is derived from I2F_LAT / FMA_LAT.
 //
-//   cycle 0: inputs presented
-//   cycle 1: S0 input register (p, cx, cy, stride captured)
-//   cycle 2: S1  i32_to_fp16 outputs (cx_fp16, cy_fp16, stride_fp16)
-//                64 fp16_fma multipliers (m[s][i] = p[s][i] * bin_fp16[i])
-//   cycle 3: S2  add-tree L1 per side (8 adds via fp16_fma);
-//                half_stride = stride_fp16 * 0.5
-//   cycle 4: S3  add-tree L2 per side (4 adds);
-//                cx_center = cx_fp16*stride + half_stride (fp16_fma)
-//                cy_center = cy_fp16*stride + half_stride
-//   cycle 5: S4  add-tree L3 per side (2 adds)
-//   cycle 6: S5  add-tree L4 per side (1 add) → d[s]
-//   cycle 7: S6  final fp16_fma per coord → x1, y1, x2, y2
+// Arrival cycles, measured relative to the S0 input register (cycle 0 = the
+// cycle the S0 output is present):
 //
-// Total latency = 7 cycles. Throughput = 1 box per cycle.
+//   Distance path (per side): 1 mul + 4 add-tree levels, all fp16_fma:
+//     m[s][i]   ready at        FMA_LAT
+//     add L1    ready at      2*FMA_LAT
+//     add L2    ready at      3*FMA_LAT
+//     add L3    ready at      4*FMA_LAT
+//     d[s]      ready at      5*FMA_LAT          (long pole)
+//
+//   Center path:
+//     cx/cy/stride_fp16  ready at  I2F_LAT
+//     half_stride        ready at  I2F_LAT + FMA_LAT
+//                          (cx_fp16/stride_fp16 are delayed FMA_LAT so all
+//                           three u_cxc inputs land together at I2F_LAT+FMA_LAT)
+//     cx_center/cy_center ready at I2F_LAT + 2*FMA_LAT
+//
+//   Final fma (per coord): inputs must all arrive at max(...) = 5*FMA_LAT:
+//     cx_center/cy_center delayed by 3*FMA_LAT − I2F_LAT
+//     neg_stride/stride_fp16 delayed from I2F_LAT to 5*FMA_LAT
+//                          (extra delay 5*FMA_LAT − I2F_LAT)
+//     output ready at      5*FMA_LAT + FMA_LAT = 6*FMA_LAT
+//
+// Total latency = 1 (S0 reg) + 6*FMA_LAT = 19 cycles. Throughput = 1/cycle.
 //
 // Bin constants 0..15 are baked as fp16 literals. The multiplier for i=0
 // is wasted (m[s][0]=0) but the tree structure is uniform; the optimizer
@@ -68,7 +83,27 @@ module box_decode (
   output logic        [15:0] y2_o
 );
 
-  // LATENCY = 7 cycles from valid_i high to valid_o high (documented above).
+  // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated;
+  // do NOT import the package (this IP lives in ~many generated build lists).
+  localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
+  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+
+  // Arrival cycles (relative to S0 output) of the values that merge at the
+  // final fmas, and the resulting bypass-delay depths.
+  localparam int unsigned D_READY        = 5*FMA_LAT;            // d[s]
+  localparam int unsigned CXC_READY       = I2F_LAT + 2*FMA_LAT; // cx_center
+  localparam int unsigned FINAL_IN        = D_READY;             // long pole
+  // u_cxc fires at I2F_LAT+FMA_LAT: delay cx_fp16/stride_fp16 by FMA_LAT
+  // so they align with half_stride at the u_cxc inputs.
+  localparam int unsigned CXC_ALIGN_DLY   = FMA_LAT;
+  // cx_center/cy_center → final fma input.
+  localparam int unsigned CXC_FINAL_DLY   = FINAL_IN - CXC_READY; // 3*FMA-I2F
+  // stride_fp16 (from i2f at I2F_LAT) → final fma input.
+  localparam int unsigned STRIDE_FINAL_DLY = FINAL_IN - I2F_LAT;  // 5*FMA-I2F
+  // valid_i → valid_o total latency: 1 (S0 reg) + 6*FMA_LAT.
+  localparam int unsigned TOTAL_LAT = 1 + 6*FMA_LAT;
+
+  // LATENCY = 19 cycles from valid_i high to valid_o high (documented above).
 
   // Baked fp16 constants for i = 0..15.
   // 0 = 0x0000, 1 = 0x3C00, 2 = 0x4000, 3 = 0x4200, 4 = 0x4400,
@@ -116,8 +151,8 @@ module box_decode (
     end
   end
 
-  // ─────────────── i32 → fp16 conversions (1 cycle) ───────────────
-  // Output appears at end of S1.
+  // ─────────────── i32 → fp16 conversions (I2F_LAT cycles) ───────────────
+  // Outputs (cx/cy/stride_fp16_s1) appear at cycle I2F_LAT.
   logic [15:0] cx_fp16_s1, cy_fp16_s1, stride_fp16_s1;
 
   // Box-decode inputs (cx, cy, stride) are all small integers bounded by
@@ -147,20 +182,13 @@ module box_decode (
     .shift_o(unused_sh_st)
   );
 
-  // ─────────────── valid pipeline (one bit per stage) ───────────────
-  logic v1, v2, v3, v4, v5, v6;
+  // ─────────────── valid pipeline (TOTAL_LAT-deep shift register) ───────────────
+  // v0 is the S0 register valid (1 cycle of latency already). The remaining
+  // TOTAL_LAT-1 stages track the rest of the pipeline to the final fma out.
+  logic [TOTAL_LAT-2:0] valid_sr;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0;
-      v4 <= 1'b0; v5 <= 1'b0; v6 <= 1'b0;
-    end else begin
-      v1 <= v0;
-      v2 <= v1;
-      v3 <= v2;
-      v4 <= v3;
-      v5 <= v4;
-      v6 <= v5;
-    end
+    if (!rst_ni) valid_sr <= '0;
+    else         valid_sr <= {valid_sr[TOTAL_LAT-3:0], v0};
   end
 
   // ─────────────── S1: 64 parallel multiplies p[s][i] * bin[i] ───────────────
@@ -198,30 +226,46 @@ module box_decode (
     end
   endgenerate
 
-  // half_stride = stride_fp16 * 0.5. Computed in S2 from S1 stride.
-  logic [15:0] half_stride_s2;
+  // half_stride = stride_fp16 * 0.5, via fp16_fma. The i2f outputs land at
+  // cycle I2F_LAT; this fma's output (half_stride) lands at I2F_LAT+FMA_LAT.
+  logic [15:0] half_stride;
   fp16_fma u_half_stride (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
     .a_i    (stride_fp16_s1),
     .b_i    (FP16_HALF),
     .c_i    (FP16_ZERO),
-    .y_o    (half_stride_s2)
+    .y_o    (half_stride)
   );
 
-  // Pipe stride_fp16 and cx_fp16, cy_fp16 from S1 through to S2.
-  logic [15:0] stride_fp16_s2, cx_fp16_s2, cy_fp16_s2;
+  // Align cx_fp16 / cy_fp16 / stride_fp16 (available at I2F_LAT) to the
+  // u_cxc/u_cyc fmas, which fire when half_stride is present (I2F_LAT+FMA_LAT).
+  // Delay each by CXC_ALIGN_DLY (= FMA_LAT) so all three inputs land together.
+  logic [15:0] cx_fp16_dl     [CXC_ALIGN_DLY];
+  logic [15:0] cy_fp16_dl     [CXC_ALIGN_DLY];
+  logic [15:0] stride_fp16_dl [CXC_ALIGN_DLY];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      stride_fp16_s2 <= 16'h0;
-      cx_fp16_s2     <= 16'h0;
-      cy_fp16_s2     <= 16'h0;
+      for (int i = 0; i < CXC_ALIGN_DLY; i++) begin
+        cx_fp16_dl[i]     <= 16'h0;
+        cy_fp16_dl[i]     <= 16'h0;
+        stride_fp16_dl[i] <= 16'h0;
+      end
     end else begin
-      stride_fp16_s2 <= stride_fp16_s1;
-      cx_fp16_s2     <= cx_fp16_s1;
-      cy_fp16_s2     <= cy_fp16_s1;
+      cx_fp16_dl[0]     <= cx_fp16_s1;
+      cy_fp16_dl[0]     <= cy_fp16_s1;
+      stride_fp16_dl[0] <= stride_fp16_s1;
+      for (int i = 1; i < CXC_ALIGN_DLY; i++) begin
+        cx_fp16_dl[i]     <= cx_fp16_dl[i-1];
+        cy_fp16_dl[i]     <= cy_fp16_dl[i-1];
+        stride_fp16_dl[i] <= stride_fp16_dl[i-1];
+      end
     end
   end
+  logic [15:0] cx_fp16_a, cy_fp16_a, stride_fp16_a;
+  assign cx_fp16_a     = cx_fp16_dl[CXC_ALIGN_DLY-1];
+  assign cy_fp16_a     = cy_fp16_dl[CXC_ALIGN_DLY-1];
+  assign stride_fp16_a = stride_fp16_dl[CXC_ALIGN_DLY-1];
 
   // ─────────────── S3: add tree level 2 (8 → 4) per side ───────────────
   logic [15:0] t4_s3 [4][4];
@@ -240,32 +284,25 @@ module box_decode (
     end
   endgenerate
 
-  // cx_center, cy_center at end of S3.
-  // cx_center = cx_fp16 * stride_fp16 + half_stride
-  logic [15:0] cx_center_s3, cy_center_s3;
+  // cx_center = cx_fp16 * stride_fp16 + half_stride.
+  // All three inputs land at I2F_LAT+FMA_LAT; output at I2F_LAT+2*FMA_LAT.
+  logic [15:0] cx_center, cy_center;
   fp16_fma u_cxc (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
-    .a_i    (cx_fp16_s2),
-    .b_i    (stride_fp16_s2),
-    .c_i    (half_stride_s2),
-    .y_o    (cx_center_s3)
+    .a_i    (cx_fp16_a),
+    .b_i    (stride_fp16_a),
+    .c_i    (half_stride),
+    .y_o    (cx_center)
   );
   fp16_fma u_cyc (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
-    .a_i    (cy_fp16_s2),
-    .b_i    (stride_fp16_s2),
-    .c_i    (half_stride_s2),
-    .y_o    (cy_center_s3)
+    .a_i    (cy_fp16_a),
+    .b_i    (stride_fp16_a),
+    .c_i    (half_stride),
+    .y_o    (cy_center)
   );
-
-  // Pipe stride_fp16 through S2→S3
-  logic [15:0] stride_fp16_s3;
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) stride_fp16_s3 <= 16'h0;
-    else         stride_fp16_s3 <= stride_fp16_s2;
-  end
 
   // ─────────────── S4: add tree level 3 (4 → 2) per side ───────────────
   logic [15:0] t2_s4 [4][2];
@@ -284,17 +321,43 @@ module box_decode (
     end
   endgenerate
 
-  // Pipe cx_center, cy_center, stride_fp16 S3→S4
-  logic [15:0] cx_center_s4, cy_center_s4, stride_fp16_s4;
+  // Skew cx_center / cy_center (ready at I2F_LAT+2*FMA_LAT) to the final
+  // fma input cycle (5*FMA_LAT) via a CXC_FINAL_DLY-deep delay line.
+  logic [15:0] cx_center_dl [CXC_FINAL_DLY];
+  logic [15:0] cy_center_dl [CXC_FINAL_DLY];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      cx_center_s4 <= 16'h0; cy_center_s4 <= 16'h0; stride_fp16_s4 <= 16'h0;
+      for (int i = 0; i < CXC_FINAL_DLY; i++) begin
+        cx_center_dl[i] <= 16'h0;
+        cy_center_dl[i] <= 16'h0;
+      end
     end else begin
-      cx_center_s4   <= cx_center_s3;
-      cy_center_s4   <= cy_center_s3;
-      stride_fp16_s4 <= stride_fp16_s3;
+      cx_center_dl[0] <= cx_center;
+      cy_center_dl[0] <= cy_center;
+      for (int i = 1; i < CXC_FINAL_DLY; i++) begin
+        cx_center_dl[i] <= cx_center_dl[i-1];
+        cy_center_dl[i] <= cy_center_dl[i-1];
+      end
     end
   end
+  logic [15:0] cx_center_f, cy_center_f;
+  assign cx_center_f = cx_center_dl[CXC_FINAL_DLY-1];
+  assign cy_center_f = cy_center_dl[CXC_FINAL_DLY-1];
+
+  // Skew stride_fp16 (ready at I2F_LAT) to the final fma input cycle
+  // (5*FMA_LAT) via a STRIDE_FINAL_DLY-deep delay line.
+  logic [15:0] stride_fp16_dl2 [STRIDE_FINAL_DLY];
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int i = 0; i < STRIDE_FINAL_DLY; i++) stride_fp16_dl2[i] <= 16'h0;
+    end else begin
+      stride_fp16_dl2[0] <= stride_fp16_s1;
+      for (int i = 1; i < STRIDE_FINAL_DLY; i++)
+        stride_fp16_dl2[i] <= stride_fp16_dl2[i-1];
+    end
+  end
+  logic [15:0] stride_fp16_f;
+  assign stride_fp16_f = stride_fp16_dl2[STRIDE_FINAL_DLY-1];
 
   // ─────────────── S5: add tree level 4 (2 → 1) per side → d[s] ───────────────
   logic [15:0] d_s5 [4];
@@ -311,22 +374,11 @@ module box_decode (
     end
   endgenerate
 
-  // Pipe cx_center, cy_center, stride_fp16 S4→S5
-  logic [15:0] cx_center_s5, cy_center_s5, stride_fp16_s5;
-  always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) begin
-      cx_center_s5 <= 16'h0; cy_center_s5 <= 16'h0; stride_fp16_s5 <= 16'h0;
-    end else begin
-      cx_center_s5   <= cx_center_s4;
-      cy_center_s5   <= cy_center_s4;
-      stride_fp16_s5 <= stride_fp16_s4;
-    end
-  end
-
-  // ─────────────── S6: final coordinates ───────────────
+  // ─────────────── Final stage: final coordinates ───────────────
+  // d[s], cx_center_f/cy_center_f and stride_fp16_f all land at 5*FMA_LAT.
   // neg_stride = -stride_fp16 (sign-bit flip)
-  logic [15:0] neg_stride_s5;
-  assign neg_stride_s5 = {~stride_fp16_s5[15], stride_fp16_s5[14:0]};
+  logic [15:0] neg_stride_f;
+  assign neg_stride_f = {~stride_fp16_f[15], stride_fp16_f[14:0]};
 
   // x1 = d_l * (-stride) + cx_center
   // x2 = d_r * (+stride) + cx_center
@@ -336,36 +388,36 @@ module box_decode (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
     .a_i    (d_s5[0]),         // d_l
-    .b_i    (neg_stride_s5),
-    .c_i    (cx_center_s5),
+    .b_i    (neg_stride_f),
+    .c_i    (cx_center_f),
     .y_o    (x1_o)
   );
   fp16_fma u_y1 (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
     .a_i    (d_s5[1]),         // d_t
-    .b_i    (neg_stride_s5),
-    .c_i    (cy_center_s5),
+    .b_i    (neg_stride_f),
+    .c_i    (cy_center_f),
     .y_o    (y1_o)
   );
   fp16_fma u_x2 (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
     .a_i    (d_s5[2]),         // d_r
-    .b_i    (stride_fp16_s5),
-    .c_i    (cx_center_s5),
+    .b_i    (stride_fp16_f),
+    .c_i    (cx_center_f),
     .y_o    (x2_o)
   );
   fp16_fma u_y2 (
     .clk_i  (clk_i),
     .rst_ni (rst_ni),
     .a_i    (d_s5[3]),         // d_b
-    .b_i    (stride_fp16_s5),
-    .c_i    (cy_center_s5),
+    .b_i    (stride_fp16_f),
+    .c_i    (cy_center_f),
     .y_o    (y2_o)
   );
 
-  assign valid_o = v6;
+  assign valid_o = valid_sr[TOTAL_LAT-2];
 
   // Silence unused-bit warnings.
   logic _unused;

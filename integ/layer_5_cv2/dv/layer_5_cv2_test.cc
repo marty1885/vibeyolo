@@ -36,7 +36,7 @@ static constexpr int OUT_W    = ROI_W;
 static constexpr double S_OUT_SILU = 12.0 / 127.0;
 
 static constexpr int DOT_LAT     = 7;    // 1 + clog2(48)
-static constexpr int REQUANT_LAT = 3;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT    = 1;
 static constexpr int TOTAL_LAT   = DOT_LAT + REQUANT_LAT + SILU_LAT;  // 11
 

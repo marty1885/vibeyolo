@@ -10,9 +10,25 @@
 // inner reduction dims (DIM_Q and BC) are TIME-MULTIPLEXED so the cell
 // count is BR*BC, not BR*BC*DIM_Q.
 //
-// fp16_fma in this repo has 1-cycle pipeline latency (single output
-// register). Sequential accumulation `c_i ← y_o` runs back-to-back
-// without stall.
+// fp16_fma in this repo has a 3-cycle pipeline latency (FMA_LAT=3,
+// mirrors fp16_lat_pkg::FP16_FMA_LAT). A fma result is therefore not in
+// cell_y until FMA_LAT cycles after its operands are driven.
+//
+// The two REDUCTION LOOPS (DOT_K over DIM_Q, PV_K over BC) run at full
+// throughput using INTERLEAVED PARTIAL SUMS: one MAC is issued every
+// cycle, and the accumulator init is FP16_ZERO for the first FMA_LAT
+// indices (else cell_y feedback). The pipeline therefore maintains
+// FMA_LAT independent partial sums per cell (residue classes k mod
+// FMA_LAT). After the loop, a small drain state (S_DOT_CAP / S_PV_CAP,
+// FMA_LAT cycles) combines the FMA_LAT final partials — which appear in
+// cell_y on FMA_LAT consecutive cycles — with the combinational fp16_add
+// into Pdot / Ppv. The accumulation ORDER differs from a latency-1
+// schedule (partials then combine), but the golden ref uses real
+// arithmetic with a 256-ULP tolerance, so this is fine.
+//
+// The constant per-col-tile "drive then sample" gaps (SCALE, EXP_D,
+// LUPD_D, MERGE_D, NORM_D) still span FMA_LAT cycles via ph_q; they are
+// not ×reduction-length so they are not the throughput problem.
 //
 // Default parameters: BR=4, BC=4 (test-friendly). Production override
 // at instantiation, e.g. BR=16 BC=32 for HEADS=2 N=400 DIM_Q=32 DIM_V=64.
@@ -23,47 +39,49 @@
 //   norm reuses score array : 0 extra
 //   TOTAL fp16_fma cells    : 528   ≤ 1500 budget
 //
-// State machine (one schedule per (head, row-tile)):
+// State machine (one schedule per (head, row-tile)). Cycle costs below
+// are with FMA_LAT=3 (L below):
 //
 //   foreach head h:
 //     foreach row-tile br:
 //       init m_r=-∞ l_r=0 O_acc=0; first_col=1
 //       foreach col-tile bc:
-//         DOT_K  : DIM_Q cycles — cell(r,j) ← cell(r,j) + Q[r,k]*K[j,k]
-//         SCALE  : 1 cycle      — cell(r,j) ← TEMP * cell(r,j)
-//         WAIT0  : 1 cycle      — let SCALE's result settle into cell_y
-//         RMAX_S : 1 cycle      — sample row_max_r from cell_y
-//         MNEW   : 1 cycle      — register m_new_r, alpha_r
-//         EXP_D  : 1 cycle      — drive cells with exp(s-m_new)
-//         EXP_S  : 1 cycle      — sample P_reg from cell_y; row_sum_r
-//         LUPD_D : 1 cycle      — drive lupd fmas
-//         LUPD_S : 1 cycle      — sample l_r ← lupd_y
+//         DOT_K  : DIM_Q*L cyc — cell(r,j) ← cell(r,j) + Q[r,k]*K[j,k]
+//         SCALE  : L cycles    — cell(r,j) ← TEMP * cell(r,j)
+//         WAIT0  : 1 cycle     — settle hop into cell_y
+//         RMAX_S : 1 cycle     — sample row_max_r from cell_y
+//         MNEW   : 1 cycle     — register m_new_r, alpha_r
+//         EXP_D  : L cycles    — drive cells with exp(s-m_new)
+//         EXP_S  : 1 cycle     — sample P_reg from cell_y; row_sum_r
+//         LUPD_D : L cycles    — drive lupd fmas
+//         LUPD_S : 1 cycle     — sample l_r ← lupd_y
 //         foreach dv_chunk:
-//           PV_K   : BC cycles  — cell(r,c) ← cell(r,c) + P[r,j]*V[j,d]
-//           PV_LAT : 1 cycle    — sample PV_part_reg from cell_y
-//           MERGE_D: 1 cycle    — drive cells: alpha*O_old + PV_part
-//           MERGE_S: 1 cycle    — sample O_acc ← cell_y
+//           PV_K   : BC*L cyc  — cell(r,c) ← cell(r,c) + P[r,j]*V[j,d]
+//           PV_LAT : 1 cycle   — sample PV_part_reg from cell_y
+//           MERGE_D: L cycles  — drive cells: alpha*O_old + PV_part
+//           MERGE_S: 1 cycle   — sample O_acc ← cell_y
 //         m_r ← m_new_r; first_col ← 0
 //       foreach norm_chunk:
-//         NORM_D : 1 cycle      — drive cells: O_acc*inv_l
-//         NORM_S : 1 cycle      — sample O_out ← cell_y
+//         NORM_D : L cycles    — drive cells: O_acc*inv_l
+//         NORM_S : 1 cycle     — sample O_out ← cell_y
 //   raise done_o
 //
-// Per-col-tile cycle cost (BR=16, BC=32, DIM_Q=32, DIM_V=64):
-//   DOT_K   DIM_Q     = 32
-//   SCALE+WAIT0       = 2
-//   RMAX_S            = 1
-//   MNEW              = 1
-//   EXP_D + EXP_S     = 2
-//   LUPD_D + LUPD_S   = 2
-//   PV per chunk      = BC + 1 + 1 + 1 = BC + 3
-//   PV total          = N_DV_CHUNK * (BC + 3) = 2 * 35 = 70
-//   total per col-tile: 32+2+1+1+2+2+70 = 110 cycles
+// Per-col-tile cycle cost (BR=16, BC=32, DIM_Q=32, DIM_V=64, L=FMA_LAT=3),
+// with the interleaved-partial reduction loops (~1 MAC/cycle):
+//   DOT_K  DIM_Q + DOT_CAP(L) = 32 + 3 = 35
+//   SCALE*L + WAIT0           = 3 + 1 = 4
+//   RMAX_S                    = 1
+//   MNEW                      = 1
+//   EXP_D*L + EXP_S           = 3 + 1 = 4
+//   LUPD_D*L + LUPD_S         = 3 + 1 = 4
+//   PV per chunk = BC + PV_CAP(L) + MERGE_D(L) + MERGE_S(1)
+//                = 32 + 3 + 3 + 1 = 39
+//   PV total                  = N_DV_CHUNK * 39 = 2 * 39 = 78
+//   total per col-tile: 35+4+1+1+4+4+78 = 127 cycles
 // Total col-tiles: HEADS * ceil(N/BR) * ceil(N/BC) = 2 * 25 * 13 = 650.
-//   col-tile cycles  = 650 * 110 = 71_500
-//   norm cycles      = HEADS * ceil(N/BR) * N_DV_CHUNK * 2
-//                    = 2 * 25 * 2 * 2 = 200
-//   TOTAL          ≈ 71_700 cycles — under 100k budget. ✔
+//   col-tile cycles  ≈ 650 * 127 = 82_550
+//   norm cycles      = HEADS * ceil(N/BR) * N_DV_CHUNK * (L+1) = 400
+//   TOTAL          ≈ 83k cycles (down from ~203k with the stall schedule).
 
 module flash_attn #(
   parameter int HEADS = 1,
@@ -90,6 +108,12 @@ module flash_attn #(
 );
 
   // ───────────────────────── derived ───────────────────────────
+  // fp16_fma is now a 3-cycle pipeline (was 1). Mirrors
+  // fp16_lat_pkg::FP16_FMA_LAT (NOT imported here, kept as a local copy
+  // so this leaf has no package dependency). Every "drive then sample"
+  // gap and every running-accumulation step must span FMA_LAT cycles so
+  // a fma result has landed in cell_y before it is read/re-accumulated.
+  localparam int unsigned FMA_LAT = 3;
   localparam int N_BR        = (N + BR - 1) / BR;
   localparam int N_BC        = (N + BC - 1) / BC;
   localparam int N_DV_CHUNK  = (DIM_V + BC - 1) / BC;
@@ -381,6 +405,7 @@ module flash_attn #(
   typedef enum logic [4:0] {
     S_IDLE,
     S_DOT_K,
+    S_DOT_CAP,
     S_SCALE,
     S_WAIT0,
     S_RMAX_S,
@@ -390,7 +415,7 @@ module flash_attn #(
     S_LUPD_D,
     S_LUPD_S,
     S_PV_K,
-    S_PV_LAT,
+    S_PV_CAP,
     S_MERGE_D,
     S_MERGE_S,
     S_NORM_D,
@@ -405,6 +430,11 @@ module flash_attn #(
   int unsigned norm_chunk_q;
   logic first_col;
 
+  // Sub-phase counter: holds a producing/accumulation state for FMA_LAT
+  // cycles so the 3-cycle fma pipeline result is in cell_y/lupd_y before
+  // we sample it or feed it back. Reset to 0 on every state transition.
+  int unsigned ph_q;
+
   // Per-row scalars
   logic [15:0] m_r       [BR];
   logic [15:0] l_r       [BR];
@@ -417,6 +447,12 @@ module flash_attn #(
   // Latches between FMA stages
   logic [15:0] P_reg       [BR][BC];
   logic [15:0] PV_part_reg [BR][BC];
+  // Interleaved-partial capture accumulators. The pipelined fma maintains
+  // FMA_LAT independent partial sums (residue classes k mod FMA_LAT); after
+  // the accumulation loop the FMA_LAT final partials appear on FMA_LAT
+  // consecutive cycles and are combined here with the combinational fp16_add.
+  logic [15:0] Pdot [BR][BC];  // QK^T dot product (full reduction over DIM_Q)
+  logic [15:0] Ppv  [BR][BC];  // P*V partial (full reduction over BC)
 
   // ───────────────────────── reductions (combinational) ────────
   logic [15:0] row_max_comb [BR];
@@ -465,14 +501,19 @@ module flash_attn #(
                             ? Q[head_q][r_g_l][kq_q] : FP16_ZERO;
             cell_b[r][j] = (r_g_l < N && j_g_l < N && int'(kq_q) < DIM_Q)
                             ? K[head_q][j_g_l][kq_q] : FP16_ZERO;
-            cell_c[r][j] = (kq_q == 0) ? FP16_ZERO : cell_y[r][j];
+            // Interleaved partials: zero-init the FMA_LAT residue classes
+            // (kq_q < FMA_LAT), then feed back each residue's running partial
+            // (cell_y is the result from FMA_LAT cycles / FMA_LAT indices ago).
+            cell_c[r][j] = (int'(kq_q) < FMA_LAT) ? FP16_ZERO : cell_y[r][j];
           end
         end
       end
       S_SCALE: begin
         for (int r = 0; r < BR; r++)
           for (int j = 0; j < BC; j++) begin
-            cell_a[r][j] = cell_y[r][j];
+            // Dot product now lives in Pdot (combined from the interleaved
+            // partials in S_DOT_CAP), not in cell_y.
+            cell_a[r][j] = Pdot[r][j];
             cell_b[r][j] = TEMP_FP16;
             cell_c[r][j] = FP16_ZERO;
           end
@@ -498,7 +539,8 @@ module flash_attn #(
                             ? P_reg[r][pv_j_q] : FP16_ZERO;
             cell_b[r][c] = (j_g_l < N && d_idx_l < DIM_V)
                             ? V[head_q][j_g_l][d_idx_l] : FP16_ZERO;
-            cell_c[r][c] = (pv_j_q == 0) ? FP16_ZERO : cell_y[r][c];
+            // Interleaved partials over the BC reduction (same scheme as DOT_K).
+            cell_c[r][c] = (int'(pv_j_q) < FMA_LAT) ? FP16_ZERO : cell_y[r][c];
           end
         end
       end
@@ -557,6 +599,7 @@ module flash_attn #(
       dv_chunk_q    <= 0;
       norm_chunk_q  <= 0;
       first_col     <= 1'b1;
+      ph_q          <= 0;
       done_o        <= 1'b0;
       for (int r = 0; r < BR; r++) begin
         m_r[r]       <= FP16_NEG_BIG;
@@ -569,6 +612,8 @@ module flash_attn #(
         for (int c = 0; c < BC; c++) begin
           P_reg[r][c]       <= FP16_ZERO;
           PV_part_reg[r][c] <= FP16_ZERO;
+          Pdot[r][c]        <= FP16_ZERO;
+          Ppv[r][c]         <= FP16_ZERO;
         end
       end
       for (int h = 0; h < HEADS; h++)
@@ -591,22 +636,56 @@ module flash_attn #(
               l_r[r] <= FP16_ZERO;
               for (int d = 0; d < DIM_V; d++) O_acc[r][d] <= FP16_ZERO;
             end
+            ph_q    <= 0;
             state_q <= S_DOT_K;
           end
         end
 
+        // S_DOT_K — running QK^T accumulation with INTERLEAVED partials.
+        // Issue one MAC per cycle (advance kq_q every cycle). The pipelined
+        // fma keeps FMA_LAT independent partial sums (residue k mod FMA_LAT).
+        // After the last index we go to S_DOT_CAP to drain & combine them.
         S_DOT_K: begin
           if (kq_q == DIM_Q - 1) begin
-            state_q <= S_SCALE;
+            kq_q    <= 0;
+            ph_q    <= 0;
+            state_q <= S_DOT_CAP;
+          end else begin
+            kq_q <= kq_q + 1;
           end
-          kq_q <= kq_q + 1;
         end
 
+        // S_DOT_CAP — drain the FMA_LAT final interleaved partials. They
+        // appear in cell_y on FMA_LAT consecutive cycles (the last MACs
+        // issued in S_DOT_K are still in flight). The default identity
+        // drive issues here land after this window and don't disturb them.
+        // Combine into Pdot with the combinational fp16_add.
+        S_DOT_CAP: begin
+          for (int r = 0; r < BR; r++)
+            for (int j = 0; j < BC; j++)
+              Pdot[r][j] <= (ph_q == 0) ? cell_y[r][j]
+                                        : fp16_add(Pdot[r][j], cell_y[r][j]);
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_SCALE;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
+        end
+
+        // S_SCALE drives cell_y*TEMP for FMA_LAT cycles so the scaled
+        // scores have settled before S_RMAX_S samples row_max.
         S_SCALE: begin
-          state_q <= S_WAIT0;
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_WAIT0;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
         end
 
-        // S_WAIT0: gives the SCALE fma a cycle to land in cell_y.
+        // S_WAIT0: scaled scores are already in cell_y here (SCALE held
+        // FMA_LAT). One identity cycle keeps cell_y stable into S_RMAX_S.
         S_WAIT0: begin
           state_q <= S_RMAX_S;
         end
@@ -632,12 +711,18 @@ module flash_attn #(
           state_q <= S_EXP_D;
         end
 
+        // S_EXP_D drives cell(r,j) <- exp(scaledScore - m_new) for
+        // FMA_LAT cycles. cell_y holds S (scaled scores) for the whole
+        // window (the identity ops in WAIT0/RMAX/MNEW keep it stable), so
+        // the exp argument is identical on every re-issue. After the
+        // window cell_y holds P.
         S_EXP_D: begin
-          // cell_y still holds S (scaled scores) — used by driver this cycle.
-          // We need to sample S now before EXP overwrites it next edge.
-          // Driver above used cell_y for the sub; that uses CURRENT cell_y
-          // which is S. cell_a/b/c set to (P_lut, 1, 0). Next edge cell_y=P.
-          state_q <= S_EXP_S;
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_EXP_S;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
         end
 
         S_EXP_S: begin
@@ -648,9 +733,16 @@ module flash_attn #(
           state_q <= S_LUPD_D;
         end
 
+        // S_LUPD_D drives the per-row lupd fmas for FMA_LAT cycles. Its
+        // operands (row_sum_r / alpha_r / l_r) are stable registers, so
+        // the re-issues are identical; lupd_y settles before S_LUPD_S.
         S_LUPD_D: begin
-          // Drives lupd inputs (combinational); next edge lupd_y updates.
-          state_q <= S_LUPD_S;
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_LUPD_S;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
         end
 
         S_LUPD_S: begin
@@ -660,22 +752,47 @@ module flash_attn #(
           state_q    <= S_PV_K;
         end
 
+        // S_PV_K — running P*V accumulation with INTERLEAVED partials
+        // (same scheme as S_DOT_K). One MAC per cycle over j=0..BC-1.
         S_PV_K: begin
           if (pv_j_q == BC - 1) begin
-            state_q <= S_PV_LAT;
+            pv_j_q  <= 0;
+            ph_q    <= 0;
+            state_q <= S_PV_CAP;
+          end else begin
+            pv_j_q <= pv_j_q + 1;
           end
-          pv_j_q <= pv_j_q + 1;
         end
 
-        S_PV_LAT: begin
-          // Sample PV partials from cell_y (just produced by last PV_K).
+        // S_PV_CAP — drain & combine the FMA_LAT final PV partials into Ppv,
+        // then load PV_part_reg from it so S_MERGE_D is unchanged downstream.
+        S_PV_CAP: begin
           for (int r = 0; r < BR; r++)
-            for (int c = 0; c < BC; c++) PV_part_reg[r][c] <= cell_y[r][c];
-          state_q <= S_MERGE_D;
+            for (int c = 0; c < BC; c++) begin
+              logic [15:0] comb;
+              comb = (ph_q == 0) ? cell_y[r][c]
+                                 : fp16_add(Ppv[r][c], cell_y[r][c]);
+              Ppv[r][c] <= comb;
+              // On the final CAP cycle, comb is the complete PV partial.
+              if (ph_q == FMA_LAT - 1) PV_part_reg[r][c] <= comb;
+            end
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_MERGE_D;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
         end
 
+        // S_MERGE_D drives cell(r,c) <- alpha*O_old + PV_part (or PV_part
+        // on first_col) for FMA_LAT cycles. Operands are stable registers.
         S_MERGE_D: begin
-          state_q <= S_MERGE_S;
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_MERGE_S;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
         end
 
         S_MERGE_S: begin
@@ -686,6 +803,7 @@ module flash_attn #(
               if (d_idx < DIM_V) O_acc[r][d_idx] <= cell_y[r][c];
             end
           end
+          ph_q <= 0;
           if (dv_chunk_q == N_DV_CHUNK - 1) begin
             // Done all DV chunks for this col-tile.
             for (int r = 0; r < BR; r++) m_r[r] <= m_new_r[r];
@@ -711,8 +829,16 @@ module flash_attn #(
           end
         end
 
+        // S_NORM_D drives O_acc*inv_l for FMA_LAT cycles; inv_l_r and
+        // O_acc are stable, so the re-issues are identical and the
+        // normalised output has settled before S_NORM_S samples it.
         S_NORM_D: begin
-          state_q <= S_NORM_S;
+          if (ph_q == FMA_LAT - 1) begin
+            ph_q    <= 0;
+            state_q <= S_NORM_S;
+          end else begin
+            ph_q <= ph_q + 1;
+          end
         end
 
         S_NORM_S: begin
@@ -726,6 +852,7 @@ module flash_attn #(
               end
             end
           end
+          ph_q <= 0;
           if (norm_chunk_q == N_DV_CHUNK - 1) begin
             // Done normalising this row-tile. Reset row state & advance.
             for (int r = 0; r < BR; r++) begin

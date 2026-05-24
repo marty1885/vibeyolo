@@ -97,8 +97,11 @@ int main(int argc, char** argv) {
         sim.tick();
     };
 
+    // Latency = I2F_LAT(2) + FMA_LAT(3) = 5 cycles; drain >= latency to
+    // flush all in-flight vectors after the last drive.
+    const int LATENCY = 5;
     const int NIT = 20000;
-    for (int i = 0; i < NIT + 4; i++) {
+    for (int i = 0; i < NIT + LATENCY + 2; i++) {
         on_edge();
         if (i < NIT) {
             std::vector<int8_t> x(kN);

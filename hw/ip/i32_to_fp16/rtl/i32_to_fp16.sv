@@ -29,6 +29,14 @@
 //
 // Implementation: leading-one count on |x|, derive shift, then barrel-shift
 // to align the implicit-1 to bit 10 with guard/round/sticky retained.
+//
+// Pipeline — LATENCY = 2 cycles (keep fp16_lat_pkg::I32_TO_FP16_LAT in
+// sync; consumer DV will fail if they drift):
+//   stage 1: absolute value, leading-one scan, prescale select, barrel
+//            right-shift → register {sign, mag_shifted, msb_post,
+//            shifted_sticky, shift_w, is_zero}.
+//   stage 2: left-justify, mantissa+G/R/S extract, RNE round, pack →
+//            register {y_o, shift_o}.
 
 module i32_to_fp16 (
   input  logic               clk_i,
@@ -98,6 +106,34 @@ module i32_to_fp16 (
     msb_post = (shift_w == 5'd0) ? msb_pos : 6'd14;
   end
 
+  // ─── stage-1 pipeline register ───────────────────────────
+  // Cut the path between the leading-one scan / barrel-shift (stage 1) and
+  // the align / round / pack (stage 2).
+  logic        s1_sign;
+  logic [31:0] s1_mag_shifted;
+  logic [5:0]  s1_msb_post;
+  logic        s1_shifted_sticky;
+  logic [4:0]  s1_shift_w;
+  logic        s1_is_zero;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      s1_sign           <= 1'b0;
+      s1_mag_shifted    <= 32'd0;
+      s1_msb_post       <= 6'd0;
+      s1_shifted_sticky <= 1'b0;
+      s1_shift_w        <= 5'd0;
+      s1_is_zero        <= 1'b1;
+    end else begin
+      s1_sign           <= sign;
+      s1_mag_shifted    <= mag_shifted;
+      s1_msb_post       <= msb_post;
+      s1_shifted_sticky <= shifted_sticky;
+      s1_shift_w        <= shift_w;
+      s1_is_zero        <= (mag == 32'd0);
+    end
+  end
+
   // ─── mantissa extraction with G/R/S for RNE ──────────────
   // Strategy: left-justify mag_shifted so the implicit 1 lands at bit 31,
   // then mantissa = bits[30:21], guard = bit[20], sticky = OR(bits[19:0])
@@ -108,14 +144,14 @@ module i32_to_fp16 (
   logic        sticky;
 
   always_comb begin
-    if (msb_post >= 6'd31) begin
-      aligned = mag_shifted;
+    if (s1_msb_post >= 6'd31) begin
+      aligned = s1_mag_shifted;
     end else begin
-      aligned = mag_shifted << (6'd31 - msb_post);
+      aligned = s1_mag_shifted << (6'd31 - s1_msb_post);
     end
     mant   = aligned[30:21];
     guard  = aligned[20];
-    sticky = (|aligned[19:0]) | shifted_sticky;
+    sticky = (|aligned[19:0]) | s1_shifted_sticky;
   end
 
   logic _unused_aligned_msb;
@@ -135,7 +171,7 @@ module i32_to_fp16 (
   logic [9:0]        mant_final;
 
   always_comb begin
-    exp_pre = 8'(signed'({2'b00, msb_post})) + 8'sd15;
+    exp_pre = 8'(signed'({2'b00, s1_msb_post})) + 8'sd15;
     if (mant_rounded[10]) begin
       exp_post   = exp_pre + 8'sd1;
       mant_final = 10'd0;
@@ -148,23 +184,23 @@ module i32_to_fp16 (
   // ─── pack / saturate / zero ──────────────────────────────
   logic [15:0] y_d;
   always_comb begin
-    if (mag == 32'd0) begin
+    if (s1_is_zero) begin
       y_d = 16'h0000;
     end else if (exp_post >= 8'sd31) begin
-      y_d = {sign, 15'h7C00};
+      y_d = {s1_sign, 15'h7C00};
     end else begin
-      y_d = {sign, exp_post[4:0], mant_final};
+      y_d = {s1_sign, exp_post[4:0], mant_final};
     end
   end
 
-  // ─── registered output ───────────────────────────────────
+  // ─── stage-2 registered output ───────────────────────────
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       y_o     <= 16'h0000;
       shift_o <= 5'd0;
     end else begin
       y_o     <= y_d;
-      shift_o <= shift_w;
+      shift_o <= s1_shift_w;
     end
   end
 

@@ -145,7 +145,7 @@ static void set_p_flat(SimCtrl<DUT>& s, int which,
 
 // ───────────────────────── driver ────────────────────────────────
 
-static const int LATENCY = 7;
+static const int LATENCY = 19;
 static const int TOLERANCE_ULP = 16;
 // Tolerance scheme — per-output-coordinate:
 //   • If |dut| and |ref| are both ≥ FP16-representable order ~1, the
@@ -189,10 +189,10 @@ struct DriveResult {
     double scale[4];
 };
 
-// Drive one input. The DUT/REF have LATENCY=7 cycles before valid_o is
+// Drive one input. The DUT/REF have LATENCY=19 cycles before valid_o is
 // asserted. We use a single-shot scheme: present input one cycle with
-// valid_i=1, then tick 6 more cycles → at end of the 7th tick the output
-// is valid.
+// valid_i=1, then tick LATENCY-1 more cycles → at end of the LATENCY-th
+// tick the output is valid.
 static DriveResult drive_one(SimCtrl<DUT>& sim,
                              const std::array<uint16_t, 16>& pl,
                              const std::array<uint16_t, 16>& pt,

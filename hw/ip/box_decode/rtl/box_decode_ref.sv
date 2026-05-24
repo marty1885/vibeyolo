@@ -5,7 +5,7 @@
 //
 // Uses real-valued arithmetic for the entire computation, then rounds
 // each of x1,y1,x2,y2 to fp16 (RNE) at the output. Pipeline latency is
-// matched to the DUT (7 cycles) so the TB can compare cycle-by-cycle.
+// matched to the DUT (19 cycles) so the TB can compare cycle-by-cycle.
 //
 // This is an "ideal real" reference; the DUT does the same computation
 // chained through fp16_fma at every step, so per-step fp16 rounding
@@ -31,7 +31,7 @@ module box_decode_ref (
   output logic        [15:0] y2_o
 );
 
-  localparam int LATENCY = 7;
+  localparam int LATENCY = 19;
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic       s;

@@ -659,7 +659,7 @@ static constexpr int OUT_W = {roi_out_w};
 static constexpr int DOT_LAT = {dot_lat};
 static constexpr int ACC_LAT = 1;
 static constexpr int RQ_IN_LAT = 1;
-static constexpr int REQUANT_LAT = 4;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT = 1;
 static constexpr int TOTAL_LAT = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT;
 
@@ -1335,9 +1335,9 @@ static constexpr int OUT_W = {roi_out_w};
 static constexpr int DOT_LAT = {dot_lat};
 static constexpr int ACC_LAT = 1;
 static constexpr int RQ_IN_LAT = 1;
-static constexpr int REQUANT_LAT = 4;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT = {silu_lat_val};
-static constexpr int ADDRQ_LAT = 5;
+static constexpr int ADDRQ_LAT = 12;
 static constexpr int TOTAL_LAT = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT + ADDRQ_LAT;
 
 static std::string stim_dir() {{ return std::string("../stim"); }}
@@ -1908,7 +1908,7 @@ static constexpr int PAD_W = {pad_w};
 static constexpr int OUT_H = {roi_out_h};
 static constexpr int OUT_W = {roi_out_w};
 static constexpr int DOT_LAT = {dot_lat};
-static constexpr int TOTAL_LAT = DOT_LAT + 1 + 1 + 4;  // no SILU/ADDRQ
+static constexpr int TOTAL_LAT = DOT_LAT + 1 + 1 + 7;  // no SILU/ADDRQ
 
 static std::string stim_dir() {{ return std::string("../stim"); }}
 static std::vector<uint32_t> load_hex(const std::string& p) {{

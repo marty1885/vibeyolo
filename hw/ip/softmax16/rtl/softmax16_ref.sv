@@ -4,7 +4,7 @@
 // softmax16_ref — behavioural golden for softmax16.
 //
 // Computes softmax in `real` arithmetic and casts each output back to
-// fp16 (RNE). Matches the DUT's pipeline latency (12 cycles) so the TB
+// fp16 (RNE). Matches the DUT's pipeline latency (14 cycles) so the TB
 // can compare cycle-by-cycle.
 
 module softmax16_ref (
@@ -18,7 +18,7 @@ module softmax16_ref (
   output logic [15:0] y_o [16]
 );
 
-  localparam int LATENCY = 12;
+  localparam int LATENCY = 14;   // == DUT 11 register stages + FMA_LAT(3)
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic        s;

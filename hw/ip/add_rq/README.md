@@ -35,20 +35,24 @@ real-number expression; this matches the semantics of the underlying
 | `scale_b_fp16_i`       | in  | 16     | fp16 per-channel scale for stream B.       |
 | `inv_out_scale_fp16_i` | in  | 16     | fp16 reciprocal of output scale.           |
 | `bias_fp16_i`          | in  | 16     | fp16 bias added before final i8 cast.      |
-| `valid_o`              | out | 1      | Output valid (5 cycles after `valid_i`).   |
+| `valid_o`              | out | 1      | Output valid (12 cycles after `valid_i`).  |
 | `y_o`                  | out | 8 (s)  | Requantized int8 result.                   |
 
 ## Pipeline
 
-5 cycles end-to-end. Each sub-block is a registered single-cycle stage:
+12 cycles end-to-end. The leaf sub-blocks are pipelined to hit the clock
+target: `i32_to_fp16` = 2 cycles, each `fp16_fma` = 3 cycles,
+`fp16_to_i8_sat` = 1 cycle (canonical values in `fp16_lat_pkg`).
 
-| Cycle | Stage                              | Function                       |
-|-------|------------------------------------|--------------------------------|
-| 1     | `i32_to_fp16` × 2 (parallel)       | int8 → fp16 dequant            |
-| 2     | `fp16_fma` × 2 (parallel)          | `ta = fp_a*sa`, `tb = fp_b*sb` |
-| 3     | `fp16_fma(ta, 1.0, tb)`            | fp16 add                       |
-| 4     | `fp16_fma(sum, inv_out, bias)`     | output requant FMA             |
-| 5     | `fp16_to_i8_sat`                   | round + saturate to int8       |
+| Stage | Latency | Block                              | Function                       |
+|-------|---------|------------------------------------|--------------------------------|
+| 0     | 2       | `i32_to_fp16` × 2 (parallel)       | int8 → fp16 dequant            |
+| 1     | 3       | `fp16_fma` × 2 (parallel)          | `ta = fp_a*sa`, `tb = fp_b*sb` |
+| 2     | 3       | `fp16_fma(ta, 1.0, tb)`            | fp16 add                       |
+| 3     | 3       | `fp16_fma(sum, inv_out, bias)`     | output requant FMA             |
+| 4     | 1       | `fp16_to_i8_sat`                   | round + saturate to int8       |
+
+Total = 2 + 3 + 3 + 3 + 1 = 12 cycles.
 
 The scales/bias inputs are pipelined alongside the data so the caller
 only needs to present them on the same cycle as `a_i8_i` / `b_i8_i`.

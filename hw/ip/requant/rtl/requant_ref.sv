@@ -8,8 +8,9 @@
 // integer arithmetic with a wide accumulator, so the composition of the
 // three sub-blocks can be checked end-to-end against a different code path.
 //
-// Pipeline: combinational compute (cvt → fma → sat), then a 3-deep output
-// register chain so the latency matches the DUT exactly.
+// Pipeline: combinational compute (cvt → fma → sat), then a TOTAL_LAT-deep
+// output register chain so the latency matches the DUT exactly. TOTAL_LAT
+// tracks the DUT: I2F_LAT(2) + scale-bump(1) + FMA_LAT(3) + sat(1) = 7.
 //
 // Algorithm:
 //   - cvt_i32_fp16 : sign + leading-1 scan + 10-bit mantissa with RNE.
@@ -388,26 +389,22 @@ module requant_ref (
     c3_i8          = sat_fp16_i8(c2_fma);
   end
 
-  // ───────────────────── 4-cycle output align ──────────────
-  logic signed [7:0] r1, r2, r3, r4;
-  logic [3:0]        v_sr;
+  // ───────────────────── TOTAL_LAT-cycle output align ──────
+  localparam int unsigned TOTAL_LAT = 7;   // == requant's I2F+1+FMA+sat
+  logic signed [7:0]      r_dl [TOTAL_LAT];
+  logic [TOTAL_LAT-1:0]   v_sr;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      r1   <= 8'sd0;
-      r2   <= 8'sd0;
-      r3   <= 8'sd0;
-      r4   <= 8'sd0;
-      v_sr <= 4'b0000;
+      for (int i = 0; i < TOTAL_LAT; i++) r_dl[i] <= 8'sd0;
+      v_sr <= '0;
     end else begin
-      r1   <= c3_i8;
-      r2   <= r1;
-      r3   <= r2;
-      r4   <= r3;
-      v_sr <= {v_sr[2:0], valid_i};
+      r_dl[0] <= c3_i8;
+      for (int i = 1; i < TOTAL_LAT; i++) r_dl[i] <= r_dl[i-1];
+      v_sr <= {v_sr[TOTAL_LAT-2:0], valid_i};
     end
   end
 
-  assign y_o     = r4;
-  assign valid_o = v_sr[3];
+  assign y_o     = r_dl[TOTAL_LAT-1];
+  assign valid_o = v_sr[TOTAL_LAT-1];
 
 endmodule

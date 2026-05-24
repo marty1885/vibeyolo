@@ -47,8 +47,11 @@
 <div class="summary">
 <strong>One-line status:</strong> All 102 conv layers ORT-validated, all six integration blocks
 (SPPF · 2× upsample · 2× attention · detect head) DV-passing, and the per-layer streaming
-datapath <code>conv_stage</code> is DV bit-exact. <strong>Throughput signed off at 12,500 FPS @ 1 GHz</strong>
-(II = 80,000 cyc, 0/102 stages over budget). The structural top-level netlist composes all 102
+datapath <code>conv_stage</code> is DV bit-exact. <strong>Throughput signed off at 12,055 FPS @ 1 GHz</strong>
+(II = 82,951 cyc, 0 stages over the 100k budget). The fp16 datapath IPs were pipelined
+(<code>i32_to_fp16</code> 1→2, <code>fp16_fma</code> 1→3 cycles) so the 1 GHz target is now
+actually closeable; the bottleneck shifted from the model.23 cls conv (80,000 cyc, unchanged)
+to the PSA attention block (82,951 cyc, fp16_fma reductions now run as interleaved partial sums). The structural top-level netlist composes all 102
 conv stages <em>plus all glue, blocks and skip-FIFOs</em> and lints clean. The full chip is
 validated end-to-end on a real image (bus.jpg) via a layer-by-layer RTL chain — same 5 detections
 as ORT. <strong>Attention is now a real <code>flash_attn</code> datapath</strong> (it had been a
@@ -71,7 +74,7 @@ silicon — no shared MAC array, no instruction fetch, no programmability.
 <tr><td>Process</td><td>TSMC N16</td><td>—</td></tr>
 <tr><td>Reticle</td><td>Half-reticle (~430 mm²)</td><td>area proxy 22,096 — comfortable</td></tr>
 <tr><td>Frame budget <code>T_FRAME</code></td><td>100,000 cycles/frame</td><td class="ok">met — worst stage 80,000</td></tr>
-<tr><td>Throughput</td><td>~10,000 FPS @ 1 GHz</td><td class="ok">12,500 FPS</td></tr>
+<tr><td>Throughput</td><td>~10,000 FPS @ 1 GHz</td><td class="ok">12,055 FPS</td></tr>
 <tr><td>Workload</td><td>YOLO26n, 640×640 input · symmetric-int8 weights/activations, FP16 math core</td><td>—</td></tr>
 <tr><td>Gate budget</td><td>~6.5 G gates (area not the binding constraint)</td><td>~25K MAC units</td></tr>
 </table>
@@ -271,7 +274,7 @@ FIFOs. There is no instruction memory, no scheduler, no shared compute fabric.
     <text x="935" y="142" text-anchor="middle" class="lbl">DETECT HEAD</text>
     <text x="935" y="159" text-anchor="middle" class="lbl2">decode + TopK + gather</text>
   </g>
-  <text x="935" y="186" text-anchor="middle" class="dim" fill="#8a1a6e">▲ bottleneck — sets the rate (II = 80,000 cyc, model.23 cls convs)</text>
+  <text x="935" y="186" text-anchor="middle" class="dim" fill="#8a1a6e">▲ bottleneck — sets the rate (II = 82,951 cyc, PSA attn; model.23 cls conv 2nd at 80,000)</text>
 
   <!-- frame-in-flight bar -->
   <rect x="25" y="200" width="991" height="20" rx="3" fill="url(#framegrad)"/>
@@ -283,11 +286,11 @@ FIFOs. There is no instruction memory, no scheduler, no shared compute fabric.
   <!-- KPI cards -->
   <g>
     <rect class="n" x="25"  y="248" width="236" height="46" fill="#f4f7fb" stroke="#2c5b9b"/>
-    <text x="38" y="272" class="kpi">12,500 FPS</text><text x="38" y="287" class="dim">@ 1 GHz</text>
+    <text x="38" y="272" class="kpi">12,055 FPS</text><text x="38" y="287" class="dim">@ 1 GHz</text>
     <rect class="n" x="269" y="248" width="236" height="46" fill="#f4f7fb" stroke="#2c5b9b"/>
-    <text x="282" y="272" class="kpi">80,000 cyc</text><text x="282" y="287" class="dim">II = slowest stage (&lt; 100k budget)</text>
+    <text x="282" y="272" class="kpi">82,951 cyc</text><text x="282" y="287" class="dim">II = slowest stage (&lt; 100k budget)</text>
     <rect class="n" x="513" y="248" width="236" height="46" fill="#f4f7fb" stroke="#2c5b9b"/>
-    <text x="526" y="272" class="kpi">≈70 frames</text><text x="526" y="287" class="dim">in flight · 5.94 ms latency</text>
+    <text x="526" y="272" class="kpi">≈70 frames</text><text x="526" y="287" class="dim">in flight · 5.93 ms latency</text>
     <rect class="n" x="757" y="248" width="259" height="46" fill="#f4f7fb" stroke="#2c5b9b"/>
     <text x="770" y="272" class="kpi">≈23× faster</text><text x="770" y="287" class="dim">vs shared-MAC FSM (~550 FPS)</text>
   </g>
@@ -299,7 +302,8 @@ fuses top-down, the PAN fuses bottom-up, and the detect head consumes all three 
 counts on every edge; ⊕ = concat). <strong>Bottom (silicon):</strong> how that graph becomes the
 chip — every op is its own block, all resident at once. Skip connections are on-die SRAM FIFOs
 (gold). Because the stages are double-buffered and run concurrently, <em>throughput is set by the
-single slowest stage</em> (the model.23 cls-branch conv at 80,000 cyc), not the sum — the same reason a CPU
+single slowest stage</em> (the PSA attention block at 82,951 cyc, just ahead of the model.23
+cls-branch conv at 80,000), not the sum — the same reason a CPU
 pipeline hits IPC≈1 on sequential code.
 </figcaption>
 </figure>
@@ -325,7 +329,7 @@ array?" The answer is no: we exploit a kind of parallelism a shared-MAC / FSM de
     <td><strong>max</strong> per-layer time (the bottleneck stage sets the rate)</td></tr>
 <tr><td>Throughput @ 1 GHz</td>
     <td>~10²–10³ FPS<br/><span class="footnote">(an FSM analysis of YOLO26n estimated ~1.8 M cyc/frame ≈ ~550 FPS)</span></td>
-    <td class="ok">~12,500 FPS (80.0K worst-stage cyc/frame)</td></tr>
+    <td class="ok">~12,055 FPS (83.0K worst-stage cyc/frame)</td></tr>
 <tr><td>Reconfigurable</td>
     <td>Yes — schedule a different model onto the same silicon</td>
     <td>No — this chip runs YOLO26n and only YOLO26n</td></tr>
@@ -477,7 +481,7 @@ Generator handles ordinary Conv+SiLU, no-activation tails, residual+SiLU, depthw
 <tr><td>Attention blocks (PSA model.10, A2C2f model.22) — real <code>flash_attn</code> datapath</td><td class="ok">Both 5/5, cos ≥ 0.9996 vs ORT on ATTN_OUT (head0 1.0, head1 0.9998); <code>flash_attn</code> prod 71,701 cyc &lt; 100k. <span class="footnote">Was a residual-only shim (flash_attn discarded via keep-alive XOR); rewritten to qkv,pe → flash_attn → +pe → ATTN_OUT on 2026-05-24.</span></td></tr>
 <tr><td>Detect head with learned top-k (end-to-end, no NMS)</td><td class="ok">7/7 DV; new leaves reduce_max_n / box_affine / dequant_n</td></tr>
 <tr><td><code>yolo26n_top</code> frozen chip boundary (AXI-S + AXI-Lite + DFT)</td><td class="ok">Lint-clean, PD handoff ready</td></tr>
-<tr><td>Throughput / latency sign-off (<code>TIMING.md</code>)</td><td class="ok">12,500 FPS, 0 misses</td></tr>
+<tr><td>Throughput / latency sign-off (<code>TIMING.md</code>)</td><td class="ok">12,055 FPS, 0 misses</td></tr>
 <tr><td>Structural <code>yolo26n_core_impl</code> — 102 conv_stage + glue + 6 blocks + skips composed</td><td class="ok">Lint-clean, full design (0 warn / 0 err)</td></tr>
 <tr><td>Inter-stage glue / block / skip-FIFO wiring in core (<code>gen_core.py</code>)</td><td class="ok">Done — C2f slice/concat + residual <code>add_rq</code> banks, 6 blocks at graph positions, 4 skip-FIFO banks; attention region rewired to 2-in ATTN_OUT + real residual adds</td></tr>
 <tr><td>End-to-end 640×640 image vs ORT (layer-by-layer RTL chain)</td><td class="ok">Same 5 detections as ORT (bus + 4 people, IoU 0.93–0.98); logits cos 0.98. All 6 block types on real RTL</td></tr>
@@ -490,12 +494,12 @@ dataflow (per-stage double-buffered), so <strong>throughput = the slowest single
 latency = the critical-path pipeline fill.</p>
 <table>
 <tr><th>Metric</th><th>Value</th><th>Spec</th><th></th></tr>
-<tr><td>Throughput (II = slowest stage)</td><td class="num">80,000 cyc</td><td>≤ 100,000</td><td class="ok">PASS</td></tr>
-<tr><td>Frames/sec @ 1 GHz</td><td class="num">12,500 FPS</td><td>≥ 10,000</td><td class="ok">PASS</td></tr>
-<tr><td>Bottleneck stage</td><td colspan="3">conv model.23 one2one_cv3 (cls 1×1 convs) — detect head TopK now 2-level sift, no longer the bottleneck</td></tr>
+<tr><td>Throughput (II = slowest stage)</td><td class="num">82,951 cyc</td><td>≤ 100,000</td><td class="ok">PASS</td></tr>
+<tr><td>Frames/sec @ 1 GHz</td><td class="num">12,055 FPS</td><td>≥ 10,000</td><td class="ok">PASS</td></tr>
+<tr><td>Bottleneck stage</td><td colspan="3">PSA attention (flash_attn, 82,951 cyc) after the fp16_fma 3-cycle pipelining; conv model.23 one2one_cv3 (cls 1×1 convs) 2nd at 80,000</td></tr>
 <tr><td>Conv stages over <code>T_FRAME</code></td><td class="num">0 / 102</td><td>0</td><td class="ok">PASS</td></tr>
-<tr><td>Worst conv stage</td><td class="num">80,000 cyc</td><td colspan="2">balanced production config</td></tr>
-<tr><td>Single-frame latency (pipeline fill)</td><td class="num">~5.94 M cyc ≈ 5.94 ms</td><td colspan="2">~70 frames in flight</td></tr>
+<tr><td>Worst conv stage</td><td class="num">80,000 cyc</td><td colspan="2">balanced production config (unchanged — pipelining adds latency, not II)</td></tr>
+<tr><td>Single-frame latency (pipeline fill)</td><td class="num">~5.93 M cyc ≈ 5.93 ms</td><td colspan="2">~70 frames in flight</td></tr>
 <tr><td>Total MAC units (full unroll)</td><td class="num">~25,261</td><td colspan="2">area proxy 22,096</td></tr>
 </table>
 <p class="footnote">
@@ -519,7 +523,7 @@ attention datapath.</p>
     (<code>tools/e2e/chain.py</code>) proves the chip on one image (all blocks on real RTL); run it over
     many real images and gate on detection agreement (IoU + class), not raw cosine. A single monolithic
     Verilator elaboration of all 102 layers remains infeasible, so this stays a block-chained flow.</li>
-<li><strong>Real silicon timing / SRAM bandwidth</strong>: the 12,500 FPS sign-off assumes "magical
+<li><strong>Real silicon timing / SRAM bandwidth</strong>: the 12,055 FPS sign-off assumes "magical
     SRAM" and per-stage double-buffering; real IO and skip-FIFO bandwidth are not yet modeled. It
     also assumes f<sub>clk</sub> = 1 GHz closes — unverified; the single-cycle <code>fp16_fma</code>
     is the likely critical path and needs pipelining before that holds.</li>

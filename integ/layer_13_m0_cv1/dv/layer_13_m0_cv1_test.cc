@@ -37,7 +37,7 @@ static constexpr double S_OUT_SILU = 4.0 / 127.0;
 
 static constexpr int DOT_LAT     = 2;   // 1 + clog2(2)
 static constexpr int ACC_LAT     = 1;   // commit reg
-static constexpr int REQUANT_LAT = 3;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT    = 1;
 static constexpr int SILU_OUT_REG_LAT = 1;
 // Latency from phase=(N_PHASE-1) valid_i to valid_o (in cycles):

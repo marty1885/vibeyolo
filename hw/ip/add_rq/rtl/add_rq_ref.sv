@@ -24,7 +24,9 @@
 //     implemented with integer arithmetic on the unpacked
 //     significand+exponent so it does not depend on host floor/ceil.
 //
-//   * Output is registered to match the DUT's 5-cycle pipeline.
+//   * Output is registered to match the DUT's pipeline latency. TOTAL_LAT
+//     tracks the DUT: I2F_LAT(2) + FMA_LAT(3) + FMA_LAT(3) + FMA_LAT(3) +
+//     SAT_LAT(1) = 12 cycles.
 
 module add_rq_ref (
   input  logic               clk_i,
@@ -320,28 +322,24 @@ module add_rq_ref (
   assign y_comb = compute(a_i8_i, b_i8_i, scale_a_fp16_i, scale_b_fp16_i,
                           inv_out_scale_fp16_i, bias_fp16_i);
 
-  // ── 5-cycle pipeline to match DUT latency ───────────────────
-  logic signed [7:0] y_pipe [3:0];
-  logic              v_pipe [3:0];
+  // ── TOTAL_LAT-cycle pipeline to match DUT latency ───────────
+  // == add_rq's I2F_LAT + 3*FMA_LAT + SAT_LAT = 2 + 9 + 1 = 12.
+  localparam int unsigned TOTAL_LAT = 12;
+  logic signed [7:0]    y_dl [TOTAL_LAT];
+  logic [TOTAL_LAT-1:0] v_sr;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      for (int i = 0; i < 4; i++) begin
-        y_pipe[i] <= 8'sd0;
-        v_pipe[i] <= 1'b0;
-      end
-      y_o     <= 8'sd0;
-      valid_o <= 1'b0;
+      for (int i = 0; i < TOTAL_LAT; i++) y_dl[i] <= 8'sd0;
+      v_sr <= '0;
     end else begin
-      y_pipe[0] <= y_comb;
-      v_pipe[0] <= valid_i;
-      for (int i = 1; i < 4; i++) begin
-        y_pipe[i] <= y_pipe[i-1];
-        v_pipe[i] <= v_pipe[i-1];
-      end
-      y_o     <= y_pipe[3];
-      valid_o <= v_pipe[3];
+      y_dl[0] <= y_comb;
+      for (int i = 1; i < TOTAL_LAT; i++) y_dl[i] <= y_dl[i-1];
+      v_sr <= {v_sr[TOTAL_LAT-2:0], valid_i};
     end
   end
+
+  assign y_o     = y_dl[TOTAL_LAT-1];
+  assign valid_o = v_sr[TOTAL_LAT-1];
 
 endmodule

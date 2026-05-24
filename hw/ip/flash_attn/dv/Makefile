@@ -29,7 +29,7 @@ dbg_FLAGS := $(LINT_FLAGS) \
            -DCFG_DUT_T=Vflash_attn_tb_dbg \
            -DCFG_NAME=\\\"dbg\\\" \
            -DCFG_HEADS=1 -DCFG_N=16 -DCFG_DIM_Q=16 -DCFG_DIM_V=4 \
-           -DCFG_FRAMES=2 -DCFG_MAX_CYC=20000 -DCFG_TEMP_FP16=0x31A8"
+           -DCFG_FRAMES=2 -DCFG_MAX_CYC=60000 -DCFG_TEMP_FP16=0x31A8"
 
 
 # ─── small ───
@@ -41,7 +41,7 @@ small_FLAGS := $(LINT_FLAGS) \
            -DCFG_DUT_T=Vflash_attn_tb_small \
            -DCFG_NAME=\\\"small\\\" \
            -DCFG_HEADS=1 -DCFG_N=8 -DCFG_DIM_Q=4 -DCFG_DIM_V=4 \
-           -DCFG_FRAMES=4 -DCFG_MAX_CYC=20000 -DCFG_TEMP_FP16=0x31A8"
+           -DCFG_FRAMES=4 -DCFG_MAX_CYC=60000 -DCFG_TEMP_FP16=0x31A8"
 
 # ─── mid1 ───
 mid1_TOP   := flash_attn_tb_mid1
@@ -51,7 +51,7 @@ mid1_FLAGS := $(LINT_FLAGS) \
            -DCFG_DUT_T=Vflash_attn_tb_mid1 \
            -DCFG_NAME=\\\"mid1\\\" \
            -DCFG_HEADS=2 -DCFG_N=64 -DCFG_DIM_Q=16 -DCFG_DIM_V=32 \
-           -DCFG_FRAMES=2 -DCFG_MAX_CYC=150000 -DCFG_TEMP_FP16=0x3400"
+           -DCFG_FRAMES=2 -DCFG_MAX_CYC=400000 -DCFG_TEMP_FP16=0x3400"
 
 # ─── mid2 ───
 mid2_TOP   := flash_attn_tb_mid2
@@ -61,7 +61,7 @@ mid2_FLAGS := $(LINT_FLAGS) \
            -DCFG_DUT_T=Vflash_attn_tb_mid2 \
            -DCFG_NAME=\\\"mid2\\\" \
            -DCFG_HEADS=1 -DCFG_N=128 -DCFG_DIM_Q=32 -DCFG_DIM_V=32 \
-           -DCFG_FRAMES=1 -DCFG_MAX_CYC=150000 -DCFG_TEMP_FP16=0x31A8"
+           -DCFG_FRAMES=1 -DCFG_MAX_CYC=400000 -DCFG_TEMP_FP16=0x31A8"
 
 # ─── prod ───
 prod_TOP   := flash_attn_tb_prod
@@ -71,6 +71,6 @@ prod_FLAGS := $(LINT_FLAGS) \
            -DCFG_DUT_T=Vflash_attn_tb_prod \
            -DCFG_NAME=\\\"prod\\\" \
            -DCFG_HEADS=2 -DCFG_N=400 -DCFG_DIM_Q=32 -DCFG_DIM_V=64 \
-           -DCFG_FRAMES=1 -DCFG_MAX_CYC=150000 -DCFG_TEMP_FP16=0x31A8"
+           -DCFG_FRAMES=1 -DCFG_MAX_CYC=400000 -DCFG_TEMP_FP16=0x31A8"
 
 include $(REPO_ROOT)/mk/verilator.mk

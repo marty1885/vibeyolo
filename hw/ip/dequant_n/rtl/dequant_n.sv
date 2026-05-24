@@ -12,7 +12,8 @@
 // exact, the fused product equals fp16(exact_i8 × scale_fp16) — so the DV
 // golden matches BIT-EXACTLY (0 ULP), unlike the fp16-accumulating box path.
 //
-// LATENCY = 2 cycles (i32_to_fp16, then fma). Throughput 1 vector/cycle.
+// LATENCY = I2F_LAT + FMA_LAT = 5 cycles (i32_to_fp16, then fma).
+// Throughput 1 vector/cycle.
 
 module dequant_n #(
   parameter int N = 80
@@ -28,18 +29,31 @@ module dequant_n #(
   output logic        [N-1:0][15:0] y_o
 );
 
-  // valid + scale alignment pipeline (2 stages).
-  logic [1:0]  vq;
-  logic [15:0] scale_s1;
+  // Leaf-IP latencies — mirror of fp16_lat_pkg (do NOT import it here, this
+  // block is instantiated in many generated build lists). DV-validated.
+  localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
+  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  // en_i → valid_o total latency.
+  localparam int unsigned TOTAL_LAT = I2F_LAT + FMA_LAT;
+
+  // valid pipeline (TOTAL_LAT-deep) so valid_o aligns with y_o.
+  logic [TOTAL_LAT-1:0] vq;
+  // scale is delayed I2F_LAT cycles so it lines up with the per-lane
+  // i32_to_fp16 output (xf_s1) feeding the fma's b input.
+  logic [15:0] scale_dl [I2F_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      vq <= 2'b0; scale_s1 <= 16'h0;
+      vq <= '0;
+      for (int i = 0; i < I2F_LAT; i++) scale_dl[i] <= 16'h0;
     end else begin
-      vq       <= {vq[0], en_i};
-      scale_s1 <= scale_i;   // align with i32_to_fp16 (S1) output
+      vq          <= {vq[TOTAL_LAT-2:0], en_i};
+      scale_dl[0] <= scale_i;
+      for (int i = 1; i < I2F_LAT; i++) scale_dl[i] <= scale_dl[i-1];
     end
   end
-  assign valid_o = vq[1];
+  logic [15:0] scale_s1;
+  assign scale_s1 = scale_dl[I2F_LAT-1];  // aligned with i32_to_fp16 output
+  assign valid_o  = vq[TOTAL_LAT-1];
 
   // verilator lint_off UNUSEDSIGNAL
   logic [4:0] sh [N];   // i32_to_fp16 auto-shift unused (int8 fits exactly)

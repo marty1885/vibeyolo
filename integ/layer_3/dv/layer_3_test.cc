@@ -44,7 +44,7 @@ static constexpr double S_OUT_SILU = 4.0 / 127.0;
 static constexpr int DOT_LAT     = 1 + 7;  // 1 + clog2(72) = 8
 static constexpr int ACC_LAT     = 1;
 static constexpr int RQ_IN_LAT   = 1;
-static constexpr int REQUANT_LAT = 4;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT    = 1;
 static constexpr int TOTAL_LAT   = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT;
 

@@ -68,9 +68,18 @@ static ShadowOut shadow_fp16(int32_t x) {
 // Convenience wrapper that returns just the fp16 value (legacy callers).
 static uint16_t shadow_fp16_y(int32_t x) { return shadow_fp16(x).fp16; }
 
+// Pipeline latency of i32_to_fp16 (== fp16_lat_pkg::I32_TO_FP16_LAT). The
+// DUT and REF both register their output this many cycles after the input
+// is sampled. apply() holds the input constant for LAT ticks so the
+// pipeline is fully drained and y_o/shift_o reflect the value just applied
+// — letting every directed / shadow check below read the result inline.
+// Overlapped (one-value-per-tick) streaming is exercised separately in
+// test 5b, which only needs the DUT==REF mismatch flag.
+static constexpr int LAT = 2;
+
 static void apply(SimCtrl<DUT>& s, int32_t x) {
     s.dut->x_i = (uint32_t)x;
-    s.tick();
+    for (int i = 0; i < LAT; i++) s.tick();
 }
 
 static uint16_t y_dut(SimCtrl<DUT>& s) { return (uint16_t)s.dut->y_dut_o; }
@@ -275,6 +284,34 @@ int main(int argc, char** argv) {
     sim.check(n_shadow_fail == 0,
               "rand: 0 dut-vs-C++-shadow mismatches (was " +
               std::to_string(n_shadow_fail) + ")");
+
+    // ─── Test 5b: overlapped streaming (full throughput) ─
+    // Feed one fresh value per tick so distinct values occupy distinct
+    // pipeline stages simultaneously, and verify DUT == REF every cycle.
+    // This is the real test of the pipelined behaviour (apply() above
+    // flushes between values and so never overlaps stages).
+    printf("test 5b: overlapped streaming, DUT==REF every cycle\n");
+    {
+        std::mt19937 srng(0x5712ED01u);
+        std::uniform_int_distribution<int64_t> sd32(INT32_MIN, INT32_MAX);
+        int n_stream_mismatch = 0;
+        const int NS = 20000;
+        for (int i = 0; i < NS; i++) {
+            sim.dut->x_i = (uint32_t)(int32_t)sd32(srng);
+            sim.tick();  // single tick → values pipeline through, stages overlap
+            if (sim.dut->mismatch_o) {
+                if (n_stream_mismatch < 5) {
+                    printf("  stream mismatch @i=%d dut=%s ref=%s sh_d=%d sh_r=%d\n",
+                           i, hex16(y_dut(sim)).c_str(), hex16(y_ref(sim)).c_str(),
+                           (int)sh_dut(sim), (int)sh_ref(sim));
+                }
+                n_stream_mismatch++;
+            }
+        }
+        sim.check(n_stream_mismatch == 0,
+                  "stream: 0 dut-vs-ref mismatches (was " +
+                  std::to_string(n_stream_mismatch) + ")");
+    }
 
     // ─── Test 6: mid-stream reset ───────────────────────
     printf("test 6: mid-stream reset clears y\n");

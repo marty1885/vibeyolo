@@ -128,8 +128,9 @@ int main(int argc, char** argv) {
     sim.check(sim.dut->valid_dut_o == 0, "valid low after reset");
     sim.check(sim.dut->valid_ref_o == 0, "ref valid low after reset");
 
-    // The pipeline is feed-forward latency 7; we drive a stream and check
+    // The pipeline is feed-forward latency 18; we drive a stream and check
     // outputs as they emerge. Keep a small in-flight queue of expectations.
+    const int LATENCY = 18;
     struct Exp { int8_t l,t,r,b; uint16_t sbox; int col,row,stride; bool v; };
     std::vector<Exp> q;
 
@@ -186,7 +187,7 @@ int main(int argc, char** argv) {
 
     // Drive directed cases with latency drain.
     for (auto& e : directed) { check_emerge(); drive(sim, e.l,e.t,e.r,e.b,e.sbox,e.col,e.row,e.stride,true); q.push_back(e); }
-    for (int i = 0; i < 10; i++) { check_emerge(); drive(sim, 0,0,0,0,S0,0,0,8,false); }
+    for (int i = 0; i < LATENCY + 2; i++) { check_emerge(); drive(sim, 0,0,0,0,S0,0,0,8,false); }
 
     sim.check(st.n_fail == 0, "directed: 0 out-of-tolerance (was " + std::to_string(st.n_fail) + ")");
     sim.check(valid_mm == 0, "directed: 0 valid-timing mismatches");
@@ -201,7 +202,7 @@ int main(int argc, char** argv) {
     const int GW[3]  = {80, 40, 20};
     st = Stat{}; valid_mm = 0; q.clear();
     const int Nrand = 20000;
-    for (int i = 0; i < Nrand + 8; i++) {
+    for (int i = 0; i < Nrand + LATENCY + 2; i++) {
         check_emerge();
         if (i < Nrand) {
             int si = dscale(rng);

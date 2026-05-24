@@ -13,11 +13,18 @@
 //                        (single rounding).
 //   4. fp16_to_i8_sat  : RNE + saturating clamp to [-128, +127].
 //
-// Pure feed-forward pipeline; total latency is 4 cycles:
-//   stage 1 register — i32_to_fp16 output
-//   stage 2 register — scale-bump output (and scale_fp16 / bias pipelined here)
-//   stage 3 register — fp16_fma output
-//   stage 4 register — fp16_to_i8_sat output
+// Pure feed-forward pipeline; total latency is
+//   I2F_LAT + 1 (scale-bump) + FMA_LAT + 1 (sat) = 2 + 1 + 3 + 1 = 7 cycles:
+//   stages 1..I2F_LAT  — i32_to_fp16 output (now 2-cycle pipelined)
+//   scale-bump register — scale-bump output (scale_fp16/bias aligned here)
+//   stages ..+FMA_LAT   — fp16_fma output (now 3-cycle pipelined)
+//   final register      — fp16_to_i8_sat output
+//
+// The i32_to_fp16 / fp16_fma latencies live in fp16_lat_pkg (the canonical
+// single source of truth). requant is instantiated in ~120 generated layer
+// build lists, so to avoid forcing the package into all of them it mirrors
+// the values in local localparams below; the lockstep DV against the
+// independent requant_ref golden fails if these ever drift.
 //
 // The change vs. the previous implementation: layers used to pre-multiply
 // scale_fp16 by 2^ACC_SHIFT in software to keep the accumulator-to-fp16
@@ -37,7 +44,14 @@ module requant (
   output logic signed  [7:0] y_o
 );
 
-  // ─── Stage 1: int32 → fp16 with prescale ─────────────────
+  // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated.
+  localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
+  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned SAT_LAT = 1;   // fp16_to_i8_sat (unchanged)
+  // valid_i → valid_o total latency.
+  localparam int unsigned TOTAL_LAT = I2F_LAT + 1 + FMA_LAT + SAT_LAT;
+
+  // ─── Stage 1: int32 → fp16 with prescale (I2F_LAT cycles) ─
   logic [15:0] s1_fp16;
   logic [4:0]  s1_shift;
 
@@ -49,18 +63,28 @@ module requant (
     .shift_o(s1_shift)
   );
 
-  // scale and bias are pipelined alongside the data so the FMA sees the
-  // matching per-channel coefficients on the same cycle as s1_fp16.
-  logic [15:0] s1_scale_q, s1_bias_q;
+  // scale and bias are delayed I2F_LAT cycles so they line up with the
+  // i32_to_fp16 output (s1_fp16 / s1_shift) feeding the scale-bump.
+  logic [15:0] scale_dl [I2F_LAT];
+  logic [15:0] bias_dl  [I2F_LAT];
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      s1_scale_q <= 16'h0000;
-      s1_bias_q  <= 16'h0000;
+      for (int i = 0; i < I2F_LAT; i++) begin
+        scale_dl[i] <= 16'h0000;
+        bias_dl[i]  <= 16'h0000;
+      end
     end else begin
-      s1_scale_q <= scale_fp16_i;
-      s1_bias_q  <= bias_fp16_i;
+      scale_dl[0] <= scale_fp16_i;
+      bias_dl[0]  <= bias_fp16_i;
+      for (int i = 1; i < I2F_LAT; i++) begin
+        scale_dl[i] <= scale_dl[i-1];
+        bias_dl[i]  <= bias_dl[i-1];
+      end
     end
   end
+  logic [15:0] s1_scale_q, s1_bias_q;
+  assign s1_scale_q = scale_dl[I2F_LAT-1];
+  assign s1_bias_q  = bias_dl[I2F_LAT-1];
 
   // ─── Stage 2: bump scale's exponent by shift ─────────────
   // scale_eff = scale * 2^shift, achieved by adding `shift` to the biased
@@ -133,12 +157,12 @@ module requant (
 
   assign y_o = s4_y;
 
-  // ─── Valid shift register (4-deep, matching the 4-cycle pipeline) ──
-  logic [3:0] valid_sr;
+  // ─── Valid shift register (TOTAL_LAT-deep, matching the pipeline) ──
+  logic [TOTAL_LAT-1:0] valid_sr;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) valid_sr <= 4'b0000;
-    else         valid_sr <= {valid_sr[2:0], valid_i};
+    if (!rst_ni) valid_sr <= '0;
+    else         valid_sr <= {valid_sr[TOTAL_LAT-2:0], valid_i};
   end
-  assign valid_o = valid_sr[3];
+  assign valid_o = valid_sr[TOTAL_LAT-1];
 
 endmodule

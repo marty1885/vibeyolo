@@ -6,7 +6,7 @@
 // Computes each lane in real arithmetic and rounds once to fp16 (RNE):
 //   y[i] = real_to_fp16( real(int8 x[i]) * fp16_to_real(scale) )
 // Since fp16(int8) is exact, this is bit-identical to the DUT's fused
-// fma(fp16(x), scale, 0) — the TB asserts 0 ULP. Latency matched (2).
+// fma(fp16(x), scale, 0) — the TB asserts 0 ULP. Latency matched (5).
 
 module dequant_n_ref #(
   parameter int N = 80
@@ -22,7 +22,7 @@ module dequant_n_ref #(
   output logic        [N-1:0][15:0] y_o
 );
 
-  localparam int LATENCY = 2;
+  localparam int LATENCY = 5;   // == DUT I2F_LAT(2) + FMA_LAT(3)
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic s; logic [4:0] eb; logic [9:0] f; real v, m; int e, k;

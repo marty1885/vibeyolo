@@ -110,13 +110,22 @@ module i32_to_fp16_ref (
   assign y_d      = cvt_pack[15:0];
   assign shift_d  = cvt_pack[20:16];
 
+  // Two registered stages so the behavioral golden matches the DUT's
+  // 2-cycle latency (fp16_lat_pkg::I32_TO_FP16_LAT) cycle-for-cycle. The
+  // compute itself stays fully combinational — only the output is delayed.
+  logic [15:0] y_s1;
+  logic [4:0]  shift_s1;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
+      y_s1    <= 16'h0000;
+      shift_s1<= 5'd0;
       y_o     <= 16'h0000;
       shift_o <= 5'd0;
     end else begin
-      y_o     <= y_d;
-      shift_o <= shift_d;
+      y_s1    <= y_d;
+      shift_s1<= shift_d;
+      y_o     <= y_s1;
+      shift_o <= shift_s1;
     end
   end
 

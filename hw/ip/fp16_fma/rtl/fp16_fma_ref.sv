@@ -323,9 +323,20 @@ module fp16_fma_ref (
   logic [15:0] y_d;
   assign y_d = fma16(a_i, b_i, c_i);
 
+  // Three registered stages so the behavioral golden matches the DUT's
+  // 3-cycle latency (fp16_lat_pkg::FP16_FMA_LAT) cycle-for-cycle. The
+  // compute stays fully combinational — only the output is delayed.
+  logic [15:0] y_s1, y_s2;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) y_o <= 16'h0000;
-    else         y_o <= y_d;
+    if (!rst_ni) begin
+      y_s1 <= 16'h0000;
+      y_s2 <= 16'h0000;
+      y_o  <= 16'h0000;
+    end else begin
+      y_s1 <= y_d;
+      y_s2 <= y_s1;
+      y_o  <= y_s2;
+    end
   end
 
 endmodule

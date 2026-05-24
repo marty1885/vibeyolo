@@ -7,7 +7,7 @@
 // (anchor - d)*stride formulation, then rounds each output to fp16 (RNE).
 // The DUT chains the same math through fp16_fma with per-step rounding and
 // a folded ×(1/1280) for centers, so the TB applies a fp16-ULP tolerance.
-// Latency matched to the DUT (7 cycles) for cycle-by-cycle comparison.
+// Latency matched to the DUT (18 cycles) for cycle-by-cycle comparison.
 
 module box_affine_ref (
   input  logic               clk_i,
@@ -30,7 +30,9 @@ module box_affine_ref (
   output logic        [15:0] h_o
 );
 
-  localparam int LATENCY = 7;
+  // Matches box_affine total latency: 1 (S0) + I2F_LAT + 5*FMA_LAT
+  // = 1 + 2 + 5*3 = 18.
+  localparam int LATENCY = 18;
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic s; logic [4:0] eb; logic [9:0] f; real v, m; int e, k;

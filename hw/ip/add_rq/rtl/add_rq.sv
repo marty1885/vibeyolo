@@ -15,17 +15,26 @@
 //   y_fp16 = sum * inv_out_scale + bias
 //   y_o    = sat_i8( round_rne( y_fp16 ) )
 //
-// Composition (all sub-blocks are 1-cycle registered):
-//   stage 0: i32_to_fp16(a), i32_to_fp16(b)            (latency 1)
-//   stage 1: fp16_fma(fp_a, scale_a, 0)  → ta          (latency 1)
+// Composition (leaf-IP latencies after pipelining for the clock target):
+//   stage 0: i32_to_fp16(a), i32_to_fp16(b)            (latency I2F_LAT=2)
+//   stage 1: fp16_fma(fp_a, scale_a, 0)  → ta          (latency FMA_LAT=3)
 //            fp16_fma(fp_b, scale_b, 0)  → tb
-//   stage 2: fp16_fma(ta, 1.0, tb)       → sum         (latency 1)
-//   stage 3: fp16_fma(sum, inv_out_scale, bias) → fp_y (latency 1)
-//   stage 4: fp16_to_i8_sat(fp_y)        → y_o         (latency 1)
+//   stage 2: fp16_fma(ta, 1.0, tb)       → sum         (latency FMA_LAT=3)
+//   stage 3: fp16_fma(sum, inv_out_scale, bias) → fp_y (latency FMA_LAT=3)
+//   stage 4: fp16_to_i8_sat(fp_y)        → y_o         (latency SAT_LAT=1)
 //
-// Total latency from valid_i to (valid_o, y_o) is 5 cycles. The
-// scales/bias inputs are pipelined alongside the data so the caller
-// only needs to present them on the same cycle as a_i/b_i.
+// Total latency from valid_i to (valid_o, y_o) is
+//   I2F_LAT + FMA_LAT + FMA_LAT + FMA_LAT + SAT_LAT = 2+3+3+3+1 = 12 cycles.
+//
+// The i32_to_fp16 / fp16_fma latencies live in fp16_lat_pkg (the canonical
+// single source of truth). add_rq is instantiated in many generated layer
+// build lists, so to avoid forcing the package into all of them it mirrors
+// the values in local localparams below; the lockstep DV against the
+// independent add_rq_ref golden fails if these ever drift.
+//
+// The scales/bias inputs are pipelined alongside the data — each side-channel
+// is delayed by the latency of the leaf it bypasses at that stage — so the
+// caller only needs to present them on the same cycle as a_i/b_i.
 
 module add_rq (
   input  logic               clk_i,
@@ -45,6 +54,11 @@ module add_rq (
 
   localparam logic [15:0] FP16_ZERO = 16'h0000;
   localparam logic [15:0] FP16_ONE  = 16'h3C00;
+
+  // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated.
+  localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
+  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned SAT_LAT = 1;   // fp16_to_i8_sat (unchanged)
 
   // ─── stage 0: int8 → fp16 via i32_to_fp16 ─────────────────────
   // Sign-extend i8 to i32 combinationally and feed to i32_to_fp16
@@ -74,24 +88,43 @@ module add_rq (
     .shift_o(unused_shift_b)
   );
 
-  // Pipeline registers for the scales/bias across stage 0.
-  logic [15:0] scale_a_s0, scale_b_s0, inv_out_s0, bias_s0;
-  logic        valid_s0;
+  // Pipeline registers for the scales/bias across stage 0 (i32_to_fp16).
+  // Delay by I2F_LAT so they realign with fp_a_s0/fp_b_s0 feeding stage 1.
+  logic [15:0] scale_a_dl [I2F_LAT];
+  logic [15:0] scale_b_dl [I2F_LAT];
+  logic [15:0] inv_out_dl [I2F_LAT];
+  logic [15:0] bias_dl    [I2F_LAT];
+  logic [I2F_LAT-1:0] valid_dl0;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      scale_a_s0 <= 16'd0;
-      scale_b_s0 <= 16'd0;
-      inv_out_s0 <= 16'd0;
-      bias_s0    <= 16'd0;
-      valid_s0   <= 1'b0;
+      for (int i = 0; i < I2F_LAT; i++) begin
+        scale_a_dl[i] <= 16'd0;
+        scale_b_dl[i] <= 16'd0;
+        inv_out_dl[i] <= 16'd0;
+        bias_dl[i]    <= 16'd0;
+      end
+      valid_dl0 <= '0;
     end else begin
-      scale_a_s0 <= scale_a_fp16_i;
-      scale_b_s0 <= scale_b_fp16_i;
-      inv_out_s0 <= inv_out_scale_fp16_i;
-      bias_s0    <= bias_fp16_i;
-      valid_s0   <= valid_i;
+      scale_a_dl[0] <= scale_a_fp16_i;
+      scale_b_dl[0] <= scale_b_fp16_i;
+      inv_out_dl[0] <= inv_out_scale_fp16_i;
+      bias_dl[0]    <= bias_fp16_i;
+      for (int i = 1; i < I2F_LAT; i++) begin
+        scale_a_dl[i] <= scale_a_dl[i-1];
+        scale_b_dl[i] <= scale_b_dl[i-1];
+        inv_out_dl[i] <= inv_out_dl[i-1];
+        bias_dl[i]    <= bias_dl[i-1];
+      end
+      valid_dl0 <= {valid_dl0[I2F_LAT-2:0], valid_i};
     end
   end
+  logic [15:0] scale_a_s0, scale_b_s0, inv_out_s0, bias_s0;
+  logic        valid_s0;
+  assign scale_a_s0 = scale_a_dl[I2F_LAT-1];
+  assign scale_b_s0 = scale_b_dl[I2F_LAT-1];
+  assign inv_out_s0 = inv_out_dl[I2F_LAT-1];
+  assign bias_s0    = bias_dl[I2F_LAT-1];
+  assign valid_s0   = valid_dl0[I2F_LAT-1];
 
   // ─── stage 1: ta = fp_a * scale_a, tb = fp_b * scale_b ────────
   logic [15:0] ta_s1, tb_s1;
@@ -114,19 +147,33 @@ module add_rq (
     .y_o    (tb_s1)
   );
 
-  logic [15:0] inv_out_s1, bias_s1;
-  logic        valid_s1;
+  // Delay inv_out/bias/valid by FMA_LAT across stage 1's fmas so they
+  // realign with ta_s1/tb_s1.
+  logic [15:0] inv_out_dl1 [FMA_LAT];
+  logic [15:0] bias_dl1    [FMA_LAT];
+  logic [FMA_LAT-1:0] valid_dl1;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      inv_out_s1 <= 16'd0;
-      bias_s1    <= 16'd0;
-      valid_s1   <= 1'b0;
+      for (int i = 0; i < FMA_LAT; i++) begin
+        inv_out_dl1[i] <= 16'd0;
+        bias_dl1[i]    <= 16'd0;
+      end
+      valid_dl1 <= '0;
     end else begin
-      inv_out_s1 <= inv_out_s0;
-      bias_s1    <= bias_s0;
-      valid_s1   <= valid_s0;
+      inv_out_dl1[0] <= inv_out_s0;
+      bias_dl1[0]    <= bias_s0;
+      for (int i = 1; i < FMA_LAT; i++) begin
+        inv_out_dl1[i] <= inv_out_dl1[i-1];
+        bias_dl1[i]    <= bias_dl1[i-1];
+      end
+      valid_dl1 <= {valid_dl1[FMA_LAT-2:0], valid_s0};
     end
   end
+  logic [15:0] inv_out_s1, bias_s1;
+  logic        valid_s1;
+  assign inv_out_s1 = inv_out_dl1[FMA_LAT-1];
+  assign bias_s1    = bias_dl1[FMA_LAT-1];
+  assign valid_s1   = valid_dl1[FMA_LAT-1];
 
   // ─── stage 2: sum = ta * 1.0 + tb (fp16 add via FMA) ──────────
   logic [15:0] sum_s2;
@@ -140,19 +187,33 @@ module add_rq (
     .y_o    (sum_s2)
   );
 
-  logic [15:0] inv_out_s2, bias_s2;
-  logic        valid_s2;
+  // Delay inv_out/bias/valid by FMA_LAT across stage 2's fma so they
+  // realign with sum_s2.
+  logic [15:0] inv_out_dl2 [FMA_LAT];
+  logic [15:0] bias_dl2    [FMA_LAT];
+  logic [FMA_LAT-1:0] valid_dl2;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      inv_out_s2 <= 16'd0;
-      bias_s2    <= 16'd0;
-      valid_s2   <= 1'b0;
+      for (int i = 0; i < FMA_LAT; i++) begin
+        inv_out_dl2[i] <= 16'd0;
+        bias_dl2[i]    <= 16'd0;
+      end
+      valid_dl2 <= '0;
     end else begin
-      inv_out_s2 <= inv_out_s1;
-      bias_s2    <= bias_s1;
-      valid_s2   <= valid_s1;
+      inv_out_dl2[0] <= inv_out_s1;
+      bias_dl2[0]    <= bias_s1;
+      for (int i = 1; i < FMA_LAT; i++) begin
+        inv_out_dl2[i] <= inv_out_dl2[i-1];
+        bias_dl2[i]    <= bias_dl2[i-1];
+      end
+      valid_dl2 <= {valid_dl2[FMA_LAT-2:0], valid_s1};
     end
   end
+  logic [15:0] inv_out_s2, bias_s2;
+  logic        valid_s2;
+  assign inv_out_s2 = inv_out_dl2[FMA_LAT-1];
+  assign bias_s2    = bias_dl2[FMA_LAT-1];
+  assign valid_s2   = valid_dl2[FMA_LAT-1];
 
   // ─── stage 3: fp_y = sum * inv_out_scale + bias ───────────────
   logic [15:0] fp_y_s3;
@@ -166,11 +227,14 @@ module add_rq (
     .y_o    (fp_y_s3)
   );
 
-  logic valid_s3;
+  // Delay valid by FMA_LAT across stage 3's fma so it realigns with fp_y_s3.
+  logic [FMA_LAT-1:0] valid_dl3;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) valid_s3 <= 1'b0;
-    else         valid_s3 <= valid_s2;
+    if (!rst_ni) valid_dl3 <= '0;
+    else         valid_dl3 <= {valid_dl3[FMA_LAT-2:0], valid_s2};
   end
+  logic valid_s3;
+  assign valid_s3 = valid_dl3[FMA_LAT-1];
 
   // ─── stage 4: i8 saturate ─────────────────────────────────────
   fp16_to_i8_sat u_sat (
@@ -180,9 +244,16 @@ module add_rq (
     .y_o    (y_o)
   );
 
+  // Delay valid by SAT_LAT across stage 4's fp16_to_i8_sat.
+  logic [SAT_LAT-1:0] valid_dl4;
   always_ff @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) valid_o <= 1'b0;
-    else         valid_o <= valid_s3;
+    if (!rst_ni) begin
+      valid_dl4 <= '0;
+    end else begin
+      valid_dl4[0] <= valid_s3;
+      for (int i = 1; i < SAT_LAT; i++) valid_dl4[i] <= valid_dl4[i-1];
+    end
   end
+  assign valid_o = valid_dl4[SAT_LAT-1];
 
 endmodule

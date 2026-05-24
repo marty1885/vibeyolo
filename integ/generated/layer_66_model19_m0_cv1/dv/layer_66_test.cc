@@ -31,7 +31,7 @@ static constexpr int PAD_W = 8;
 static constexpr int OUT_H = 8;
 static constexpr int OUT_W = 8;
 static constexpr int DOT_LAT = 3;
-static constexpr int TOTAL_LAT = DOT_LAT + 1 + 1 + 4;  // no SILU/ADDRQ
+static constexpr int TOTAL_LAT = DOT_LAT + 1 + 1 + 7;  // no SILU/ADDRQ
 
 static std::string stim_dir() { return std::string("../stim"); }
 static std::vector<uint32_t> load_hex(const std::string& p) {

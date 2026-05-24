@@ -56,10 +56,15 @@ module attn #(
 
   localparam int N      = H * W;                 // 400
   localparam int CntW   = (N <= 1) ? 1 : $clog2(N) + 1;
-  // Pipeline depths:
-  localparam int QKV_LAT = 2;                    // i32_to_fp16 → fp16_fma
+  // Pipeline depths. The leaf IPs were pipelined for timing — keep these in
+  // sync with fp16_lat_pkg (i32_to_fp16=2, fp16_fma=3); the attn DV (which
+  // exercises the real leaf RTL end-to-end) fails if they drift.
+  localparam int I2F_LAT = 2;                    // == fp16_lat_pkg::I32_TO_FP16_LAT
+  localparam int FMA_LAT = 3;                    // == fp16_lat_pkg::FP16_FMA_LAT
+  // QKV deq chain: i32_to_fp16 → fp16_fma(×S_QKV)
+  localparam int QKV_LAT = I2F_LAT + FMA_LAT;          // 5
   // ATTN_OUT chain: i2f → fma(×S_PE) → fma(O+pe) → fma(×INV_S_AOUT) → sat_i8
-  localparam int AO_LAT  = 5;
+  localparam int AO_LAT  = I2F_LAT + 3*FMA_LAT + 1;    // 12
   localparam int DRIVE_TAIL_Q = QKV_LAT;
   localparam int DRIVE_TAIL_A = AO_LAT;
 
@@ -299,7 +304,8 @@ module attn #(
   //   r3    : sum   = fp16_fma(o_d2, 1.0, pe_fp)   (= O + pe)
   //   r4    : y_fp  = fp16_fma(sum, INV_S_AOUT, 0)
   //   r5    : i8    = fp16_to_i8_sat(y_fp)
-  // AO_LAT = 5 from driven token to captured int8.
+  // AO_LAT = I2F_LAT + 3*FMA_LAT + 1 = 12 from driven token to captured
+  // int8 (each fma is FMA_LAT=3 cycles, i2f is I2F_LAT=2, sat is 1).
   //
   // O channel layout: ATTN_OUT channel c == head (c/DIM_V), value-dim
   // (c%DIM_V). flash_attn packs O as o_flat[16*(h*N*DIM_V + n*DIM_V + d)].
@@ -347,12 +353,18 @@ module attn #(
     logic [15:0] pe_fp;
     fp16_fma u_pe (.clk_i, .rst_ni, .a_i(pe_s0), .b_i(S_PE_FP16), .c_i(FP16_ZERO), .y_o(pe_fp));
 
-    // Delay O by 2 cycles to align with pe_fp (i2f + fma).
-    logic [15:0] o_d1, o_d2;
-    always_ff @(posedge clk_i) begin o_d1 <= o_val; o_d2 <= o_d1; end
+    // Delay O to align with pe_fp at the u_sum input. pe_fp is produced
+    // I2F_LAT + FMA_LAT cycles after the token is driven (i2f then ×S_PE
+    // fma), so O must be delayed by the same amount.
+    localparam int O_ALIGN = I2F_LAT + FMA_LAT;
+    logic [15:0] o_dl [O_ALIGN];
+    always_ff @(posedge clk_i) begin
+      o_dl[0] <= o_val;
+      for (int i = 1; i < O_ALIGN; i++) o_dl[i] <= o_dl[i-1];
+    end
 
     logic [15:0] sum, y_fp;
-    fp16_fma u_sum (.clk_i, .rst_ni, .a_i(o_d2), .b_i(FP16_ONE),       .c_i(pe_fp),     .y_o(sum));
+    fp16_fma u_sum (.clk_i, .rst_ni, .a_i(o_dl[O_ALIGN-1]), .b_i(FP16_ONE), .c_i(pe_fp), .y_o(sum));
     fp16_fma u_y   (.clk_i, .rst_ni, .a_i(sum),  .b_i(INV_S_AOUT_FP16), .c_i(FP16_ZERO), .y_o(y_fp));
 
     logic signed [7:0] yi8;

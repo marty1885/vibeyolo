@@ -41,8 +41,12 @@ BLOCKS = [
     ("SPPF /model.9 (maxpool x3 + concat, 20^2 C128)",        400*3 + 400 + 64, "analytic"),
     ("upsample /model.11+12 (P4->P3, store 20^2 + concat 40^2)", 40*40 + 20*20 + 64, "analytic"),
     ("upsample /model.14+15 (P3->det, store 40^2 + concat 80^2)", 80*80 + 40*40 + 64, "analytic"),
-    ("attn PSA /model.10 (flash_attn HEADS2 N400)",            74_911, "dv"),
-    ("attn A2C2f /model.22 (flash_attn HEADS2 N400)",          74_911, "dv"),
+    # flash_attn grew 74,911 -> 82,951 after fp16_fma was pipelined to 3
+    # cycles: the QK^T / PV reductions now run as FMA_LAT-way interleaved
+    # partial sums (1 MAC/cyc) plus a short combine, vs the old back-to-back
+    # latency-1 accumulation. (A naive per-step stall would have been 203k.)
+    ("attn PSA /model.10 (flash_attn HEADS2 N400)",            82_951, "dv"),
+    ("attn A2C2f /model.22 (flash_attn HEADS2 N400)",          82_951, "dv"),
     # 8,400 decode + 43,583 worst-case topk (2-level sift-down) + ~319 gather.
     # (Was 84,700 with the old 1-level sift, topk worst = 75,981.)
     ("detect head /model.23 (decode + topk300 + gather)",      52_302, "dv"),

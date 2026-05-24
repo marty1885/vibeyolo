@@ -35,9 +35,9 @@ static constexpr int OUT_W    = ROI_W;
 static constexpr double S_OUT_ADD = 80.0 / 127.0;
 
 static constexpr int DOT_LAT     = 8;   // 1 + clog2(72) = 8
-static constexpr int REQUANT_LAT = 3;
+static constexpr int REQUANT_LAT = 7;
 static constexpr int SILU_LAT    = 1;
-static constexpr int ADD_LAT     = 5;
+static constexpr int ADD_LAT     = 12;
 static constexpr int TOTAL_LAT   = DOT_LAT + REQUANT_LAT + SILU_LAT + ADD_LAT;  // 17
 
 static std::string stim_dir() { return std::string("../stim"); }

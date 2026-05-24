@@ -141,7 +141,7 @@ static void get_y_flat(SimCtrl<DUT>& s, bool from_dut,
 
 // ───────────────────────── driver ────────────────────────────────
 
-static const int LATENCY = 12;
+static const int LATENCY = 14;   // 11 register stages + fp16_fma FMA_LAT(3)
 static const int TOLERANCE_ULP = 32;
 // Tolerance budget (per fp16 output lane, sign-magnitude ULP distance):
 //   exp LUT (1024 entries, step 1/64)         : ~8 ULP
