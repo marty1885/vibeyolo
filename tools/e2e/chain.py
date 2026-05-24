@@ -34,6 +34,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 ONNX = os.path.join(ROOT, "integ/yolo26n/model_int8.onnx")
 E2E = os.path.join(ROOT, "integ/generated/e2e")
 COSIM = os.path.join(ROOT, "tools/e2e/cosim")
+CALIB_JSON = os.path.join(E2E, "calib_scales.json")
+
+
+def load_calib():
+    """corpus-calibrated per-conv fixed scales (calibrate.py); name -> dict.
+    Covers ALL 102 convs incl. the attn-internal ones meta.json misses."""
+    if os.path.exists(CALIB_JSON):
+        return json.load(open(CALIB_JSON)).get("scales", {})
+    return {}
 
 
 def cos(a, b):
@@ -113,7 +122,7 @@ def layer_sout(conv_name):
 
 
 # ───────────────────────── chip-faithful conv ─────────────────────────
-def conv_numpy(fp_in, s_in, p, s_pre, s_silu):
+def conv_numpy(fp_in, s_in, p, s_pre, s_silu, out_bits=8):
     W = p["W_raw"]; K = p["K"]; S = p["S"]; PAD = p["PAD"]
     COUT = W.shape[0]
     if p["dw"]:
@@ -137,8 +146,13 @@ def conv_numpy(fp_in, s_in, p, s_pre, s_silu):
     pre = acc * (s_in * p["s_w"]) + p["bias"][:, None, None]
     pre_code = np.clip(np.round(pre / s_pre), -128, 127) * s_pre
     y = pre_code / (1.0 + np.exp(-pre_code)) if p["silu"] else pre_code
-    out_code = np.clip(np.round(y / s_silu), -128, 127)
-    return (out_code * s_silu).astype(np.float32)
+    # out_bits>8: finer output quantization over the SAME range (s_eff=s*127/qmax),
+    # i.e. a wider output code out of the requant — MAC array unchanged. Used to
+    # study whether a wider cls-logit output breaks the int8 detection score ties.
+    qmax = 2 ** (out_bits - 1) - 1
+    s_eff = s_silu * 127.0 / qmax
+    out_code = np.clip(np.round(y / s_eff), -qmax - 1, qmax)
+    return (out_code * s_eff).astype(np.float32)
 
 
 def conv_rtl(fp_in, s_in, p, s_pre, s_silu, idx):
@@ -491,10 +505,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stop-after", type=int, default=10**9)
     ap.add_argument("--conv", choices=["numpy", "rtl"], default="numpy")
+    ap.add_argument("--cls-bits", type=int, default=8,
+                    help="output bit-width of the 3 cls-logit tail convs "
+                         "(cv3.x.2); >8 = finer logit resolution to break detection "
+                         "score ties (numpy model only; MAC array unchanged).")
+    ap.add_argument("--scales", choices=["dynamic", "fixed"], default="dynamic",
+                    help="dynamic: per-image pick_s_out (oracle, RTL can't do this). "
+                         "fixed: the chip's baked per-layer calibrated S_OUT_PRE/"
+                         "S_OUT_SILU from meta.json — faithful to the synthesized IP "
+                         "and keeps the RTL per-layer build cache valid across images.")
     ap.add_argument("--rtl-blocks", default="",
                     help="comma list of blocks to run via real RTL IP "
                          "(sppf,upsample,attn,detect) or 'all'")
     ap.add_argument("--pixels", default="assets/pixel_values.npy")
+    ap.add_argument("--image", default="assets/bus.jpg",
+                    help="source image used as the letterbox base for rendering")
+    ap.add_argument("--metrics-json", default="",
+                    help="if set, write logits/boxes cos + detection counts as JSON")
     ap.add_argument("--render", nargs="?", const="integ/generated/e2e/chain_result.png",
                     default="integ/generated/e2e/chain_result.png",
                     help="output PNG path (side-by-side ORT vs chip); '' to disable")
@@ -505,14 +532,16 @@ def main():
 
     # ORT golden: final outputs + every conv cluster output (for per-layer cos)
     conv_out_tensors = [p["out"] for p in CONV_BY_DQL.values()]
+    # Also expose RTL block outputs (e.g. attn Add) so we can print their cos.
+    block_out_tensors = [ot for ot, (kind, _) in BLOCK_RTL.items()]
     g2 = onnx.load(ONNX); ex = {o.name for o in g2.graph.output}
-    for t in conv_out_tensors:
+    for t in conv_out_tensors + block_out_tensors:
         if t not in ex:
             g2.graph.output.append(onnx.helper.make_tensor_value_info(t, 1, None))
     tmp = os.path.join(E2E, "_chain_ort.onnx"); onnx.save(g2, tmp)
     so = ort.SessionOptions(); so.log_severity_level = 3
     sess = ort.InferenceSession(tmp, sess_options=so, providers=["CPUExecutionProvider"])
-    want = ["logits", "pred_boxes"] + conv_out_tensors
+    want = ["logits", "pred_boxes"] + conv_out_tensors + block_out_tensors
     ortv = dict(zip(want, sess.run(want, {in_name: x})))
 
     rtl_blocks = set()
@@ -520,6 +549,11 @@ def main():
         rtl_blocks = ({"sppf", "upsample", "attn", "detect"}
                       if args.rtl_blocks == "all"
                       else set(args.rtl_blocks.split(",")))
+
+    CALIB = load_calib() if args.scales == "fixed" else {}
+    if args.scales == "fixed":
+        print(f"scales=fixed: {len(CALIB)} convs from calib_scales.json"
+              if CALIB else "scales=fixed: no calib_scales.json, using meta.json")
 
     vals = {in_name: x[0]}      # carry as CHW (drop batch); ops use numpy broadcasting
     scales = {}
@@ -531,18 +565,34 @@ def main():
             idx = NAME2IDX.get(p["conv"].name, -1)
             fp_in = vals[p["fp_in"]]
             if fp_in.ndim == 4: fp_in = fp_in[0]
+            # fixed-scale mode: use the chip's baked per-conv calibrated scales,
+            # exactly what conv_stage synthesizes as S_OUT_PRE/S_OUT_SILU.
+            # Priority: corpus calib_scales.json (all 102 convs, percentile-based)
+            # > per-layer meta.json (92 dumped, bus-only max-based) > dynamic.
+            fixed = None
+            if args.scales == "fixed":
+                fixed = CALIB.get(p["conv"].name)
+                if fixed is None and idx >= 0:
+                    mp = os.path.join(E2E, f"layer_{idx:03d}", "meta.json")
+                    if os.path.exists(mp):
+                        fixed = json.load(open(mp))
             s_in = scales.get(p["fp_in"])
             if s_in is None:
-                s_in = pick_s_out(float(np.max(np.abs(fp_in))))
+                s_in = (fixed["s_in"] if fixed else
+                        pick_s_out(float(np.max(np.abs(fp_in)))))
             pre = conv_pre(fp_in, s_in, p)
-            s_pre = pick_s_out(float(np.max(np.abs(pre))))
+            s_pre = (fixed["s_out_pre"] if fixed else
+                     pick_s_out(float(np.max(np.abs(pre)))))
             pre_code = np.clip(np.round(pre / s_pre), -128, 127) * s_pre
             y = pre_code / (1.0 + np.exp(-pre_code)) if p["silu"] else pre_code
-            s_silu = pick_s_out(float(np.max(np.abs(y))))
+            s_silu = (fixed["s_out_silu"] if fixed else
+                      pick_s_out(float(np.max(np.abs(y)))))
+            is_cls_tail = re.search(r"/one2one_cv3\.\d+\.2/Conv_quant$", p["conv"].name)
+            ob = args.cls_bits if is_cls_tail else 8
             if args.conv == "rtl" and idx >= 0:
                 out = conv_rtl(fp_in, s_in, p, s_pre, s_silu, idx)
             else:
-                out = conv_numpy(fp_in, s_in, p, s_pre, s_silu)
+                out = conv_numpy(fp_in, s_in, p, s_pre, s_silu, out_bits=ob)
             vals[p["out"]] = out[None]      # restore batch dim for downstream ops
             scales[p["out"]] = s_silu
             n_conv += 1
@@ -563,7 +613,8 @@ def main():
             fn = BLOCK_FN.get(ot) or BLOCK_FN[kind]
             out, s_out = fn(*args_fp, *scls)
             vals[ot] = out[None]; scales[ot] = s_out
-            print(f"  block[{kind}] RTL -> {ot}  shape={tuple(out.shape)}")
+            cmsg = f" cos={cos(out, ortv[ot][0]):.5f}" if ot in ortv else ""
+            print(f"  block[{kind}] RTL -> {ot}  shape={tuple(out.shape)}{cmsg}")
         else:
             try:
                 outs = run_op(node, vals)
@@ -587,15 +638,47 @@ def main():
             print(f"{t}: NOT PRODUCED")
 
     if "logits" in vals and "pred_boxes" in vals:
-        compare_detections(vals["logits"], vals["pred_boxes"],
-                           ortv["logits"], ortv["pred_boxes"])
+        cd, od = compare_detections(vals["logits"], vals["pred_boxes"],
+                                    ortv["logits"], ortv["pred_boxes"])
         if args.render:
             render_result(vals["logits"], vals["pred_boxes"],
                           ortv["logits"], ortv["pred_boxes"], args.render,
-                          args.conv)
+                          args.conv, args.image)
+        if args.metrics_json:
+            # per-detection IoU of each chip det to best same-class ORT det
+            ious = []
+            for c, cf, b in cd:
+                best = max([_iou(b, ob_) for c_, cf_, ob_ in od if c_ == c],
+                           default=0.0)
+                ious.append(best)
+            metrics = dict(
+                image=os.path.basename(args.image),
+                logits_cos=cos(vals["logits"], ortv["logits"]),
+                boxes_cos=cos(vals["pred_boxes"], ortv["pred_boxes"]),
+                worst_conv_cos=worst[0], worst_conv_idx=worst[1],
+                chip_dets=len(cd), ort_dets=len(od),
+                matched=int(sum(1 for i in ious if i >= 0.5)),
+                median_iou=float(np.median(ious)) if ious else 0.0,
+                render=args.render, conv_mode=args.conv,
+                chip=[[int(c), float(cf), [float(v) for v in b]] for c, cf, b in cd],
+                ort=[[int(c), float(cf), [float(v) for v in b]] for c, cf, b in od],
+            )
+            mp = os.path.join(ROOT, args.metrics_json)
+            os.makedirs(os.path.dirname(mp), exist_ok=True)
+            json.dump(metrics, open(mp, "w"), indent=2)
+            print(f"wrote metrics -> {args.metrics_json}")
 
 
-COCO = {0: "person", 5: "bus", 2: "car", 7: "truck"}
+COCO = {i: n for i, n in enumerate(
+    "person bicycle car motorcycle airplane bus train truck boat traffic_light "
+    "fire_hydrant stop_sign parking_meter bench bird cat dog horse sheep cow "
+    "elephant bear zebra giraffe backpack umbrella handbag tie suitcase frisbee "
+    "skis snowboard sports_ball kite baseball_bat baseball_glove skateboard "
+    "surfboard tennis_racket bottle wine_glass cup fork knife spoon bowl banana "
+    "apple sandwich orange broccoli carrot hot_dog pizza donut cake chair couch "
+    "potted_plant bed dining_table toilet tv laptop mouse remote keyboard "
+    "cell_phone microwave oven toaster sink refrigerator book clock vase "
+    "scissors teddy_bear hair_drier toothbrush".split())}
 
 
 def _dets(logits, boxes, conf_thr=0.25):
@@ -622,25 +705,26 @@ def compare_detections(cl, cb, ol, ob):
     print(f"\n── detections (conf>=0.25) ──  chip={len(cd)}  ORT={len(od)}")
     print("  ORT (reference):")
     for c, cf, b in od:
-        print(f"    {COCO.get(c,c):8s} conf={cf:.3f} box={np.round(b,3)}")
+        print(f"    {COCO.get(c, str(c)):8s} conf={cf:.3f} box={np.round(b,3)}")
     print("  chip (chained):")
     for c, cf, b in cd:
         # best IoU match to an ORT det of same class
         best = max([( _iou(b, ob_) , cf_) for c_, cf_, ob_ in od if c_ == c],
                    default=(0.0, 0.0))
-        print(f"    {COCO.get(c,c):8s} conf={cf:.3f} box={np.round(b,3)}  "
+        print(f"    {COCO.get(c, str(c)):8s} conf={cf:.3f} box={np.round(b,3)}  "
               f"bestIoU={best[0]:.2f}")
+    return cd, od
 
 
-def render_result(cl, cb, ol, ob, out_path, conv_mode):
+def render_result(cl, cb, ol, ob, out_path, conv_mode, image="assets/bus.jpg"):
     """Draw ORT (reference) vs chained-chip detections side by side on the
     letterboxed 640 image and save a PNG."""
     from PIL import Image, ImageDraw
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from preprocess import letterbox
-    src = np.asarray(Image.open(os.path.join(ROOT, "assets/bus.jpg")).convert("RGB"),
-                     dtype=np.uint8)
+    ipath = image if os.path.isabs(image) else os.path.join(ROOT, image)
+    src = np.asarray(Image.open(ipath).convert("RGB"), dtype=np.uint8)
     base = Image.fromarray(letterbox(src))            # 640x640 RGB
     S = base.size[0]
 
@@ -650,7 +734,7 @@ def render_result(cl, cb, ol, ob, out_path, conv_mode):
             cx, cy, w, h = (b * S).tolist()
             x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
             d.rectangle([x0, y0, x1, y1], outline=color, width=3)
-            lbl = f"{COCO.get(c, c)} {cf:.2f}"
+            lbl = f"{COCO.get(c, str(c))} {cf:.2f}"
             d.rectangle([x0, y0 - 12, x0 + 8 * len(lbl), y0], fill=color)
             d.text((x0 + 1, y0 - 11), lbl, fill=(0, 0, 0))
         return img
@@ -660,7 +744,8 @@ def render_result(cl, cb, ol, ob, out_path, conv_mode):
     canvas = Image.new("RGB", (S * 2 + 12, S + 24), (20, 20, 20))
     canvas.paste(left, (0, 24)); canvas.paste(right, (S + 12, 24))
     d = ImageDraw.Draw(canvas)
-    d.text((6, 6), "ORT reference (fp32)", fill=(0, 220, 0))
+    d.text((6, 6), f"ORT reference (fp32)  [{os.path.basename(image)}]",
+           fill=(0, 220, 0))
     d.text((S + 18, 6), f"chip chained ({conv_mode} convs, symmetric int8)",
            fill=(255, 90, 0))
     op = os.path.join(ROOT, out_path)

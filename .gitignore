@@ -41,6 +41,8 @@ tools/e2e/cosim/build/
 integ/generated/e2e/
 # Derived input tensors (re-derivable from source images)
 assets/*.npy
+# Calibration image corpora (GB-scale, re-downloadable: COCO val2017 + QOI suite)
+assets/calib/
 # yosys/abc scratch + local scheduler state
 abc.history
 .claude/
