@@ -15,7 +15,9 @@ module attn_tb #(
   parameter int HEADS    = 2,
   parameter int DIM_Q    = 32,
   parameter int DIM_K    = 32,
-  parameter int DIM_V    = 64
+  parameter int DIM_V    = 64,
+  parameter int unsigned ACC_EXP  = 8,
+  parameter int unsigned ACC_MANT = 21
 ) (
   input  logic                              clk_i,
   input  logic                              rst_ni,
@@ -38,7 +40,8 @@ module attn_tb #(
 
   attn #(
     .H(H), .W(W), .C_QKV(C_QKV), .C_FE(C_FE),
-    .HEADS(HEADS), .DIM_Q(DIM_Q), .DIM_K(DIM_K), .DIM_V(DIM_V)
+    .HEADS(HEADS), .DIM_Q(DIM_Q), .DIM_K(DIM_K), .DIM_V(DIM_V),
+    .ACC_EXP(ACC_EXP), .ACC_MANT(ACC_MANT)
   ) u_dut (
     .clk_i        (clk_i),
     .rst_ni       (rst_ni),

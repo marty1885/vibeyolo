@@ -31,7 +31,10 @@ module attn #(
   parameter int DIM_V    = 64,
   parameter int BR       = 16,
   parameter int BC       = 32,
-  parameter logic [15:0] TEMP_FP16 = 16'h31A8   // 1/sqrt(32) in fp16
+  parameter logic [15:0] TEMP_FP16 = 16'h31A8,  // 1/sqrt(32) in fp16
+  // flash_attn wide accumulator (see flash_attn.sv). Sweepable for accuracy.
+  parameter int unsigned ACC_EXP  = 8,
+  parameter int unsigned ACC_MANT = 21
 ) (
   input  logic                              clk_i,
   input  logic                              rst_ni,
@@ -284,6 +287,8 @@ module attn #(
     .BR          (BR),
     .BC          (BC),
     .TEMP_FP16   (TEMP_FP16),
+    .ACC_EXP     (ACC_EXP),
+    .ACC_MANT    (ACC_MANT),
     .MAX_CYC_HINT(100000)
   ) u_fa (
     .clk_i   (clk_i),

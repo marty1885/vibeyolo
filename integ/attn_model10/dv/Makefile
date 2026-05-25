@@ -17,6 +17,7 @@ RTL_SRCS := \
   $(IP_DIR)/dotN/rtl/dotN.sv \
   $(IP_DIR)/i32_to_fp16/rtl/i32_to_fp16.sv \
   $(IP_DIR)/fp16_fma/rtl/fp16_fma.sv \
+  $(IP_DIR)/fp16_macw/rtl/fp16_macw.sv \
   $(IP_DIR)/fp16_to_i8_sat/rtl/fp16_to_i8_sat.sv \
   $(IP_DIR)/flash_attn/rtl/flash_attn.sv \
   $(S_DIR)/attn.sv \
@@ -25,6 +26,9 @@ RTL_SRCS := \
 CC_SRCS := $(CURDIR)/attn_test.cc
 
 LINT_FLAGS := -Wno-UNOPTFLAT -Wno-ASCRANGE -Wno-SELRANGE -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-REALCVT -Wno-BLKSEQ -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL -Wno-IMPLICITSTATIC -Wno-WIDTHCONCAT -Wno-LATCH -Wno-ENUMVALUE
+# Sweep hook: ACC_MANT=NN / ACC_EXP=NN in the environment overrides the
+# flash_attn wide-accumulator width at build time (via top-level -G).
+LINT_FLAGS += $(if $(ACC_MANT),-GACC_MANT=$(ACC_MANT)) $(if $(ACC_EXP),-GACC_EXP=$(ACC_EXP))
 VERILATOR_THREADS ?= 1
 
 include $(REPO_ROOT)/mk/verilator.mk

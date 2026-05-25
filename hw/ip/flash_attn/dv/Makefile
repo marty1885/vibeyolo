@@ -3,11 +3,13 @@ ifeq ($(REPO_ROOT),)
 REPO_ROOT := $(abspath $(CURDIR)/../../../..)
 endif
 
-FMA_DIR := $(REPO_ROOT)/hw/ip/fp16_fma/rtl
-FA_DIR  := $(REPO_ROOT)/hw/ip/flash_attn/rtl
+FMA_DIR  := $(REPO_ROOT)/hw/ip/fp16_fma/rtl
+MACW_DIR := $(REPO_ROOT)/hw/ip/fp16_macw/rtl
+FA_DIR   := $(REPO_ROOT)/hw/ip/flash_attn/rtl
 
 COMMON_RTL := \
   $(FMA_DIR)/fp16_fma.sv \
+  $(MACW_DIR)/fp16_macw.sv \
   $(FA_DIR)/flash_attn.sv \
   $(FA_DIR)/flash_attn_ref.sv
 
@@ -15,6 +17,7 @@ TEST_CC := $(CURDIR)/flash_attn_test.cc
 
 LINT_SRCS := \
   $(FMA_DIR)/fp16_fma.sv \
+  $(MACW_DIR)/fp16_macw.sv \
   $(FA_DIR)/flash_attn.sv \
   $(FA_DIR)/flash_attn_ref.sv
 LINT_FLAGS := -Wno-MULTITOP -Wno-UNOPTFLAT -Wno-ENUMVALUE -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDPARAM -Wno-LATCH -Wno-UNUSEDSIGNAL -Wno-WIDTHCONCAT
