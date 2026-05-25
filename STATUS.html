@@ -42,7 +42,7 @@
 <body>
 
 <h1>vibeyolo — YOLO26n Inference ASIC</h1>
-<div class="meta">Half-reticle N16 fixed-function accelerator · Status as of 2026-05-24</div>
+<div class="meta">Half-reticle N16 fixed-function accelerator · Status as of 2026-05-25</div>
 
 <div class="summary">
 <strong>One-line status:</strong> All 102 conv layers ORT-validated, all six integration blocks
@@ -52,12 +52,17 @@ datapath <code>conv_stage</code> is DV bit-exact. <strong>Throughput signed off 
 (<code>i32_to_fp16</code> 1→2, <code>fp16_fma</code> 1→3 cycles) so the 1 GHz target is now
 actually closeable; the bottleneck shifted from the model.23 cls conv (80,000 cyc, unchanged)
 to the PSA attention block (82,951 cyc, fp16_fma reductions now run as interleaved partial sums). The structural top-level netlist composes all 102
-conv stages <em>plus all glue, blocks and skip-FIFOs</em> and lints clean. The full chip is
-validated end-to-end on a real image (bus.jpg) via a layer-by-layer RTL chain — same 5 detections
-as ORT. <strong>Attention is now a real <code>flash_attn</code> datapath</strong> (it had been a
-shim that discarded the attention result; fixed 2026-05-24). Remaining for tape-out: swap the
-generated core body into the frozen <code>yolo26n_top</code> boundary, then scale verification to a
-large image set.
+conv stages <em>plus all glue, blocks and skip-FIFOs</em> and lints clean. The full chip is now
+validated end-to-end across <strong>24 diverse real images</strong> (22 COCO + zidane + bus) on full
+RTL (<code>conv_stage</code> + all six block IPs) via the layer-by-layer chain — <strong>92/96
+detections matched, 0 collapses</strong> — after percentile (99.9th) re-calibration of all 102
+convs. <strong>Attention is a real <code>flash_attn</code> datapath with a wide (~fp32) accumulator</strong>
+(<code>fp16_macw</code>), which recovers the marginal detection that plain fp16 accumulation dropped:
+the chained RTL now matches ORT 5/5 on bus.jpg (it had been a shim that discarded the attention
+result; fixed 2026-05-24). First-order <strong>physical estimates</strong> are in too — ~41 mm² die,
+7.3 W, 13 TOPS/W on N16 — and the inter-stage activation-SRAM bandwidth is now modeled (banked, II
+unchanged), retiring the "magical SRAM" caveat. Remaining for tape-out: swap the generated core body
+into the frozen <code>yolo26n_top</code> boundary and run calibration over the full image corpus.
 </div>
 
 <h2>1. Project Goal</h2>
@@ -72,7 +77,7 @@ silicon — no shared MAC array, no instruction fetch, no programmability.
 <table>
 <tr><th>Parameter</th><th>Target</th><th>Status</th></tr>
 <tr><td>Process</td><td>TSMC N16</td><td>—</td></tr>
-<tr><td>Reticle</td><td>Half-reticle (~430 mm²)</td><td>area proxy 22,096 — comfortable</td></tr>
+<tr><td>Reticle</td><td>Half-reticle (~430 mm²)</td><td class="ok">41.1 mm² est. (N16) — 0.10× half-reticle</td></tr>
 <tr><td>Frame budget <code>T_FRAME</code></td><td>100,000 cycles/frame</td><td class="ok">met — worst stage 80,000</td></tr>
 <tr><td>Throughput</td><td>~10,000 FPS @ 1 GHz</td><td class="ok">12,055 FPS</td></tr>
 <tr><td>Workload</td><td>YOLO26n, 640×640 input · symmetric-int8 weights/activations, FP16 math core</td><td>—</td></tr>
@@ -478,13 +483,13 @@ Generator handles ordinary Conv+SiLU, no-activation tails, residual+SiLU, depthw
 <tr><td><code>conv_stage</code> — synthesizable per-layer streaming wrapper</td><td class="ok">DV bit-exact vs conv_layer (5 configs)</td></tr>
 <tr><td>SPPF block (model.9, between L31/L32)</td><td class="ok">10/10 checks, cos ≥ 0.99994</td></tr>
 <tr><td>Upsample blocks (P4→P3, P3→detect)</td><td class="ok">5/5 samples bit-exact, cos 0.9995–0.9998</td></tr>
-<tr><td>Attention blocks (PSA model.10, A2C2f model.22) — real <code>flash_attn</code> datapath</td><td class="ok">Both 5/5, cos ≥ 0.9996 vs ORT on ATTN_OUT (head0 1.0, head1 0.9998); <code>flash_attn</code> prod 71,701 cyc &lt; 100k. <span class="footnote">Was a residual-only shim (flash_attn discarded via keep-alive XOR); rewritten to qkv,pe → flash_attn → +pe → ATTN_OUT on 2026-05-24.</span></td></tr>
+<tr><td>Attention blocks (PSA model.10, A2C2f model.22) — real <code>flash_attn</code> datapath, wide accumulator</td><td class="ok">Both 5/5, cos ≥ 0.9996 vs ORT on ATTN_OUT (head0 1.0, head1 0.9998); <code>flash_attn</code> prod 71,701 cyc &lt; 100k. Reductions now accumulate in a wide (~fp32) float (<code>fp16_macw</code>, ACC_MANT 21) and round to fp16 once — this recovers the marginal bus.jpg detection that fp16 accumulation dropped (5/5 vs ORT at ACC_MANT ≥ 16; <code>tools/e2e/sweep_acc.sh</code>). <span class="footnote">Was a residual-only shim (flash_attn discarded via keep-alive XOR); rewritten to qkv,pe → flash_attn → +pe → ATTN_OUT on 2026-05-24.</span></td></tr>
 <tr><td>Detect head with learned top-k (end-to-end, no NMS)</td><td class="ok">7/7 DV; new leaves reduce_max_n / box_affine / dequant_n</td></tr>
 <tr><td><code>yolo26n_top</code> frozen chip boundary (AXI-S + AXI-Lite + DFT)</td><td class="ok">Lint-clean, PD handoff ready</td></tr>
 <tr><td>Throughput / latency sign-off (<code>TIMING.md</code>)</td><td class="ok">12,055 FPS, 0 misses</td></tr>
 <tr><td>Structural <code>yolo26n_core_impl</code> — 102 conv_stage + glue + 6 blocks + skips composed</td><td class="ok">Lint-clean, full design (0 warn / 0 err)</td></tr>
 <tr><td>Inter-stage glue / block / skip-FIFO wiring in core (<code>gen_core.py</code>)</td><td class="ok">Done — C2f slice/concat + residual <code>add_rq</code> banks, 6 blocks at graph positions, 4 skip-FIFO banks; attention region rewired to 2-in ATTN_OUT + real residual adds</td></tr>
-<tr><td>End-to-end 640×640 image vs ORT (layer-by-layer RTL chain)</td><td class="ok">Same 5 detections as ORT (bus + 4 people, IoU 0.93–0.98); logits cos 0.98. All 6 block types on real RTL</td></tr>
+<tr><td>End-to-end vs ORT — 24-image set on full RTL (layer-by-layer chain)</td><td class="ok">92/96 detections matched, 17/24 fully matched, <strong>0 collapses</strong> after 99.9th-percentile re-calibration of all 102 convs (<code>tools/e2e/calibrate.py</code>); bus.jpg 5/5 (IoU 0.93–0.98). All 6 block types on real RTL. <span class="footnote">Gated on detection agreement (IoU + class), not raw cosine. Surfaced + fixed a stale-scale build-cache bug (<code>--scales fixed</code>) and a max-based-calibration collapse.</span></td></tr>
 <tr><td>Generated core swapped into frozen <code>yolo26n_top</code> body</td><td class="warn">Pending — top still instantiates the skeletal placeholder core</td></tr>
 </table>
 
@@ -504,45 +509,70 @@ latency = the critical-path pipeline fill.</p>
 </table>
 <p class="footnote">
 Numbers are from the static per-layer schedule (balanced production scale package) plus measured
-block DV cycle counts. Real silicon timing and SRAM bandwidth are not yet modeled. Without
-per-stage double-buffering (one frame in flight) throughput would drop to ~168 FPS — the design
-assumes double-buffering, consistent with the "worst-stage sets the rate" model.
+block DV cycle counts. Gate-level timing closure (f<sub>clk</sub> = 1 GHz) is still unverified, but
+SRAM bandwidth is now modeled (§6.1). Without per-stage double-buffering (one frame in flight)
+throughput would drop to ~168 FPS — the design assumes double-buffering, consistent with the
+"worst-stage sets the rate" model.
 </p>
 
+<h3 id="physical">6.1 Physical estimates — area · power · SRAM bandwidth</h3>
+<p>First-order estimates for an <strong>N16</strong> target, generated by <code>tools/chip_area.py</code>,
+<code>tools/power.py</code> and <code>tools/sram_bw.py</code>. These are <strong>coarse</strong>
+(node-scaled per-op energy, placeholder SRAM macro density — swap in MemoryCompiler / liberty output
+to firm up); the <em>breakdowns</em> are more trustworthy than the absolute totals.</p>
+<table>
+<tr><th>Metric (N16, 1 GHz)</th><th>Value</th><th>Note</th></tr>
+<tr><td>Die area (total)</td><td class="num">41.1 mm²</td><td>0.10× half-reticle — logic 29.8 / act-SRAM 8.4 / weight-ROM 2.9 mm²; area is <em>not</em> the binding constraint</td></tr>
+<tr><td>Power (total)</td><td class="num">7.34 W</td><td>dynamic 6.11 W (compute 78%, clock 20%, SRAM 1.5%) + leakage 1.23 W</td></tr>
+<tr><td>Energy / inference</td><td class="num">0.61 mJ</td><td>3.97 GMAC/frame · 96 TOPS peak int8 · <strong>13.1 TOPS/W</strong></td></tr>
+<tr><td>Activation SRAM</td><td class="num">4.32 MB</td><td>linebuf + skip-FIFO + block/attn/detect stores; 1,185 banked macros, 8.37 mm²</td></tr>
+<tr><td>SRAM bandwidth (banked)</td><td class="ok">0 mems &lt; 1 GHz</td><td>tiling each memory to 1 access/cyc holds II = 82,951 (12,055 FPS). Refusing to bank serializes the widest pixel edges (worst conv 15×) → 868 FPS</td></tr>
+</table>
+<p class="footnote">A sky130 profile is also supported (<code>tools/sram_model.py:PDKS</code>) and lands at
+~1,635 mm² / 128 W / 0.4 TOPS/W @ 0.511 GHz — i.e. the design only makes sense on an advanced node;
+the N16 numbers above are the real target.</p>
+
 <h2>7. What's left</h2>
-<p class="footnote">Done since the last revision: top-level glue/block/skip wiring (<code>gen_core.py</code>
-composes the full netlist, lints clean); end-to-end real-image validation via the RTL chain; and the
-attention block, which had been a shim that discarded <code>flash_attn</code>'s output, is now a real
-attention datapath.</p>
+<p class="footnote">Done since the last revision: end-to-end validation scaled from one image to a
+24-image set on full RTL (92/96 detections, 0 collapses) with 99.9th-percentile re-calibration of all
+102 convs; the <code>flash_attn</code> reductions now accumulate in a wide (~fp32) float
+(<code>fp16_macw</code>), recovering the marginal bus.jpg detection (5/5 vs ORT); and first-order
+physical estimates (§6.1: ~41 mm², 7.3 W, SRAM bandwidth modeled).</p>
 <ol>
 <li><strong>Swap the generated core into the frozen boundary</strong>: <code>yolo26n_top</code> still
     instantiates the skeletal placeholder <code>yolo26n_core</code> (drains pixels, emits zeros) so PD
     has a stable boundary to floorplan. Replace its body with the generated
     <code>yolo26n_core_impl</code> dataflow netlist (or reconcile the two), keeping ports frozen.</li>
-<li><strong>Scale verification to a large image set</strong>: the layer-by-layer RTL chain
-    (<code>tools/e2e/chain.py</code>) proves the chip on one image (all blocks on real RTL); run it over
-    many real images and gate on detection agreement (IoU + class), not raw cosine. A single monolithic
-    Verilator elaboration of all 102 layers remains infeasible, so this stays a block-chained flow.</li>
-<li><strong>Real silicon timing / SRAM bandwidth</strong>: the 12,055 FPS sign-off assumes "magical
-    SRAM" and per-stage double-buffering; real IO and skip-FIFO bandwidth are not yet modeled. It
-    also assumes f<sub>clk</sub> = 1 GHz closes — unverified; the single-cycle <code>fp16_fma</code>
-    is the likely critical path and needs pipelining before that holds.</li>
+<li><strong>Calibrate + verify over the full image corpus</strong>: the layer-by-layer RTL chain
+    (<code>tools/e2e/chain.py</code>) now proves the chip on 24 diverse real images (all blocks on real
+    RTL), gated on detection agreement (IoU + class) — 92/96 matched, 0 collapses. Before tape-out, run
+    <code>tools/e2e/calibrate_full.sh</code> over the 7,973-image corpus to freeze the static scales,
+    then re-sweep. A single monolithic Verilator elaboration of all 102 layers remains infeasible, so
+    this stays a block-chained flow.</li>
+<li><strong>Gate-level timing closure</strong>: the 12,055 FPS sign-off assumes f<sub>clk</sub> = 1 GHz
+    closes — still unverified. The fp16 datapath was pipelined (<code>i32_to_fp16</code> 1→2,
+    <code>fp16_fma</code> 1→3) to make it closeable, but it needs a real synthesis/STA pass to confirm.
+    SRAM bandwidth is no longer a hand-wave — it is modeled (§6.1) and met by banking.</li>
 </ol>
 
 <h2>8. Risks &amp; open questions</h2>
 <ul>
-<li><strong>Skip-FIFO SRAM bandwidth:</strong> P3/P4/P5 skip buffers must absorb burst writes from
-    the backbone and feed slower reads to the neck/head. Sizing is set by the static schedule;
-    bandwidth is assumed adequate but not yet measured.</li>
-<li><strong>External activation IO:</strong> the current model assumes "magical SRAM" — streams in
-    and out without contention. Real IO bandwidth may force <code>T_FRAME</code> down (the per-layer
-    <code>P_PIX/P_COUT/P_CIN</code> knobs re-balance at a slacker budget).</li>
+<li><strong>SRAM macro density is a placeholder:</strong> §6.1 shows banking holds II at every
+    memory (0 mems &lt; 1 GHz), but the macro area/fmax come from an N16-ish placeholder model
+    (<code>tools/sram_model.py</code>), not real MemoryCompiler output. The verdict ("bank it; area is
+    cheap") should survive real numbers, but the 8.4 mm² figure will move.</li>
+<li><strong>External activation IO:</strong> the model covers on-die activation SRAM but still assumes
+    input/output streams in and out without contention. Real chip-boundary IO bandwidth may force
+    <code>T_FRAME</code> down (the per-layer <code>P_PIX/P_COUT/P_CIN</code> knobs re-balance at a
+    slacker budget).</li>
 <li><strong>Whole-chip verification:</strong> all 102 layers in one Verilator design is infeasible
     (lint of the conv backbone alone is ~80 s / ~8 GB). End-to-end validation must be a
     block-chained C++/golden flow, not a monolithic elaboration.</li>
-<li><strong>Detect-head on real images:</strong> end-to-end vs ORT is meaningful only on real
-    images with separated detections — on object-free synthetic input the TopK boundary churns and
-    cosine collapses even when the hardware is correct (gated instead on an int8 reference).</li>
+<li><strong>Detect-head validation methodology (done — caveat stands):</strong> the head now runs as
+    real RTL across the 24-image set and is gated on detection agreement (IoU + class), since on
+    object-free / tie-heavy inputs the TopK boundary churns and raw logits cosine collapses even when
+    the hardware is correct. So the verification gap is closed — but keep gating on detections, not
+    cosine; cosine remains a misleading metric for this block.</li>
 </ul>
 
 </body>
