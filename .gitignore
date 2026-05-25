@@ -43,6 +43,8 @@ integ/generated/e2e/
 assets/*.npy
 # Calibration image corpora (GB-scale, re-downloadable: COCO val2017 + QOI suite)
 assets/calib/
+# Generated PDK reports (re-derivable from tools/chip_area.py, power.py, sram_bw.py)
+reports/
 # yosys/abc scratch + local scheduler state
 abc.history
 .claude/
