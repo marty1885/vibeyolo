@@ -22,7 +22,7 @@ module dequant_n_ref #(
   output logic        [N-1:0][15:0] y_o
 );
 
-  localparam int LATENCY = 5;   // == DUT I2F_LAT(2) + FMA_LAT(3)
+  localparam int LATENCY = 7;   // == DUT I2F_LAT(2) + FMA_LAT(5)
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic s; logic [4:0] eb; logic [9:0] f; real v, m; int e, k;

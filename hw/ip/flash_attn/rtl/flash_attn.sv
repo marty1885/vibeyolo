@@ -11,8 +11,8 @@
 // count is BR*BC, not BR*BC*DIM_Q.
 //
 // The MAC cells are fp16_macw: fp16 a*b plus a WIDE-float accumulator
-// (ACC_EXP/ACC_MANT, default 8/21 ≈ fp32 precision), 3-cycle pipeline
-// latency (FMA_LAT=3, mirrors fp16_lat_pkg::FP16_FMA_LAT). A result is not
+// (ACC_EXP/ACC_MANT, default 8/21 ≈ fp32 precision), 5-cycle pipeline
+// latency (FMA_LAT=5, mirrors fp16_lat_pkg::FP16_FMA_LAT). A result is not
 // in cell_y until FMA_LAT cycles after its operands are driven. cell_y is
 // the wide accumulator; cell_y_f16 is its combinational fp16 view, used by
 // every fp16 consumer (softmax max/sum, exp arg, output sampling).
@@ -52,7 +52,7 @@
 // ACC_MANT≥16 recovers the bus.jpg detection (default 21 for margin).
 //
 // State machine (one schedule per (head, row-tile)). Cycle costs below
-// are with FMA_LAT=3 (L below):
+// are with FMA_LAT=5 (L below):
 //
 //   foreach head h:
 //     foreach row-tile br:
@@ -65,11 +65,11 @@
 //         MNEW   : 1 cycle     — register m_new_r, alpha_r
 //         EXP_D  : L cycles    — drive cells with exp(s-m_new)
 //         EXP_S  : 1 cycle     — sample P_reg from cell_y; row_sum_r
-//         LUPD_D : L cycles    — drive lupd fmas
-//         LUPD_S : 1 cycle     — sample l_r ← lupd_y
+//         (LUPD overlaps PV: the per-row lupd fmas run on separate cells;
+//          l_r is sampled inside the first PV_CAP, costing 0 extra cycles)
 //         foreach dv_chunk:
 //           PV_K   : BC*L cyc  — cell(r,c) ← cell(r,c) + P[r,j]*V[j,d]
-//           PV_LAT : 1 cycle   — sample PV_part_reg from cell_y
+//           PV_CAP : L cycles  — drain partials; sample l_r on dv_chunk 0
 //           MERGE_D: L cycles  — drive cells: alpha*O_old + PV_part
 //           MERGE_S: 1 cycle   — sample O_acc ← cell_y
 //         m_r ← m_new_r; first_col ← 0
@@ -78,22 +78,25 @@
 //         NORM_S : 1 cycle     — sample O_out ← cell_y
 //   raise done_o
 //
-// Per-col-tile cycle cost (BR=16, BC=32, DIM_Q=32, DIM_V=64, L=FMA_LAT=3),
-// with the interleaved-partial reduction loops (~1 MAC/cycle):
-//   DOT_K  DIM_Q + DOT_CAP(L) = 32 + 3 = 35
-//   SCALE*L + WAIT0           = 3 + 1 = 4
+// Per-col-tile cycle cost (BR=16, BC=32, DIM_Q=32, DIM_V=64, L=FMA_LAT=5),
+// with the interleaved-partial reduction loops (~1 MAC/cycle). The reduction
+// loops run max(reduction,L) cycles; here DIM_Q=BC=32 ≥ L so they equal the
+// reduction length and only the fixed L-spanning states grew (3→5):
+//   DOT_K  DIM_Q + DOT_CAP(L) = 32 + 5 = 37
+//   SCALE*L + WAIT0           = 5 + 1 = 6
 //   RMAX_S                    = 1
 //   MNEW                      = 1
-//   EXP_D*L + EXP_S           = 3 + 1 = 4
-//   LUPD_D*L + LUPD_S         = 3 + 1 = 4
+//   EXP_D*L + EXP_S           = 5 + 1 = 6
+//   (LUPD now overlaps PV — 0 cycles, was 6)
 //   PV per chunk = BC + PV_CAP(L) + MERGE_D(L) + MERGE_S(1)
-//                = 32 + 3 + 3 + 1 = 39
-//   PV total                  = N_DV_CHUNK * 39 = 2 * 39 = 78
-//   total per col-tile: 35+4+1+1+4+4+78 = 127 cycles
+//                = 32 + 5 + 5 + 1 = 43
+//   PV total                  = N_DV_CHUNK * 43 = 2 * 43 = 86
+//   total per col-tile: 37+6+1+1+6+86 = 137 cycles
 // Total col-tiles: HEADS * ceil(N/BR) * ceil(N/BC) = 2 * 25 * 13 = 650.
-//   col-tile cycles  ≈ 650 * 127 = 82_550
-//   norm cycles      = HEADS * ceil(N/BR) * N_DV_CHUNK * (L+1) = 400
-//   TOTAL          ≈ 83k cycles (down from ~203k with the stall schedule).
+//   col-tile cycles  ≈ 650 * 137 = 89_050
+//   norm cycles      = HEADS * ceil(N/BR) * N_DV_CHUNK * (L+1) = 600
+//   TOTAL          ≈ 89.6k cycles (LUPD overlapped into PV, −3.9k vs the
+//                    serial schedule). Throughput ≥10k FPS @1 GHz.
 
 module flash_attn #(
   parameter int HEADS = 1,
@@ -129,15 +132,28 @@ module flash_attn #(
 );
 
   // ───────────────────────── derived ───────────────────────────
-  // fp16_fma is now a 3-cycle pipeline (was 1). Mirrors
-  // fp16_lat_pkg::FP16_FMA_LAT (NOT imported here, kept as a local copy
-  // so this leaf has no package dependency). Every "drive then sample"
+  // fp16_fma / fp16_macw are now a 5-cycle pipeline (was 3, originally 1).
+  // Mirrors fp16_lat_pkg::FP16_FMA_LAT (NOT imported here, kept as a local
+  // copy so this leaf has no package dependency). Every "drive then sample"
   // gap and every running-accumulation step must span FMA_LAT cycles so
   // a fma result has landed in cell_y before it is read/re-accumulated.
-  localparam int unsigned FMA_LAT = 3;
+  localparam int unsigned FMA_LAT = 5;
   localparam int N_BR        = (N + BR - 1) / BR;
   localparam int N_BC        = (N + BC - 1) / BC;
   localparam int N_DV_CHUNK  = (DIM_V + BC - 1) / BC;
+
+  // The interleaved-partial reductions keep FMA_LAT independent residue
+  // classes (k mod FMA_LAT). The drain (S_DOT_CAP / S_PV_CAP) reads the
+  // FMA_LAT final partials on FMA_LAT consecutive cycles, which requires
+  // each residue class to have been issued at least once *before* the
+  // drain window opens — i.e. the loop must run for at least FMA_LAT
+  // cycles. When the reduction length is shorter than FMA_LAT we pad the
+  // loop with zero-MACs (a=b=0 via the existing < DIM_Q / < BC guards, so
+  // the unused residue slots accumulate to WIDE_ZERO and drop out of the
+  // sum). For production dims (DIM_Q,BC ≥ FMA_LAT) these equal DIM_Q/BC and
+  // nothing changes.
+  localparam int DOT_STEPS = (DIM_Q > int'(FMA_LAT)) ? DIM_Q : int'(FMA_LAT);
+  localparam int PV_STEPS  = (BC    > int'(FMA_LAT)) ? BC    : int'(FMA_LAT);
   localparam logic [15:0] FP16_ONE     = 16'h3C00;
   localparam logic [15:0] FP16_ZERO    = 16'h0000;
   localparam logic [15:0] FP16_NEG_BIG = 16'hFBFF;  // very negative finite
@@ -605,8 +621,6 @@ module flash_attn #(
     S_MNEW,
     S_EXP_D,
     S_EXP_S,
-    S_LUPD_D,
-    S_LUPD_S,
     S_PV_K,
     S_PV_CAP,
     S_MERGE_D,
@@ -733,9 +747,11 @@ module flash_attn #(
             int j_g_l, d_idx_l;
             j_g_l   = col_idx(pv_j_q);
             d_idx_l = int'(dv_chunk_q) * BC + c;
-            cell_a[r][c] = (j_g_l < N && d_idx_l < DIM_V)
+            // int'(pv_j_q) < BC also masks the FMA_LAT-pad cycles (when
+            // BC < FMA_LAT) so P_reg[r][pv_j_q] is never read out of range.
+            cell_a[r][c] = (int'(pv_j_q) < BC && j_g_l < N && d_idx_l < DIM_V)
                             ? P_reg[r][pv_j_q] : FP16_ZERO;
-            cell_b[r][c] = (j_g_l < N && d_idx_l < DIM_V)
+            cell_b[r][c] = (int'(pv_j_q) < BC && j_g_l < N && d_idx_l < DIM_V)
                             ? V[head_q][j_g_l][d_idx_l] : FP16_ZERO;
             // Interleaved partials over the BC reduction (same scheme as DOT_K).
             cell_c[r][c] = (int'(pv_j_q) < FMA_LAT) ? WIDE_ZERO : cell_y[r][c];
@@ -845,7 +861,7 @@ module flash_attn #(
         // fma keeps FMA_LAT independent partial sums (residue k mod FMA_LAT).
         // After the last index we go to S_DOT_CAP to drain & combine them.
         S_DOT_K: begin
-          if (kq_q == DIM_Q - 1) begin
+          if (kq_q == DOT_STEPS - 1) begin
             kq_q    <= 0;
             ph_q    <= 0;
             state_q <= S_DOT_CAP;
@@ -935,23 +951,14 @@ module flash_attn #(
           for (int r = 0; r < BR; r++)
             for (int c = 0; c < BC; c++) P_reg[r][c] <= cell_y_f16[r][c];
           for (int r = 0; r < BR; r++) row_sum_r[r] <= row_sum_comb[r];
-          state_q <= S_LUPD_D;
-        end
-
-        // S_LUPD_D drives the per-row lupd fmas for FMA_LAT cycles. Its
-        // operands (row_sum_r / alpha_r / l_r) are stable registers, so
-        // the re-issues are identical; lupd_y settles before S_LUPD_S.
-        S_LUPD_D: begin
-          if (ph_q == FMA_LAT - 1) begin
-            ph_q    <= 0;
-            state_q <= S_LUPD_S;
-          end else begin
-            ph_q <= ph_q + 1;
-          end
-        end
-
-        S_LUPD_S: begin
-          for (int r = 0; r < BR; r++) l_r[r] <= lupd_y[r];
+          // The l-update (LUPD) now overlaps PV: the per-row lupd fmas are
+          // driven combinationally and run on the SEPARATE per-row fma cells
+          // (disjoint from the BR*BC score/PV array), so once row_sum_r /
+          // alpha_r are stable here, lupd_y settles within FMA_LAT cycles —
+          // far inside the PV reduction (≥ FMA_LAT cyc). l_r is sampled in
+          // S_PV_CAP. This drops the dedicated S_LUPD_D/S_LUPD_S states
+          // (−(FMA_LAT+1) cyc/col-tile) at zero area. l_r is only consumed
+          // at the final NORM and by the next col-tile, both far later.
           pv_j_q     <= 0;
           dv_chunk_q <= 0;
           state_q    <= S_PV_K;
@@ -960,7 +967,7 @@ module flash_attn #(
         // S_PV_K — running P*V accumulation with INTERLEAVED partials
         // (same scheme as S_DOT_K). One MAC per cycle over j=0..BC-1.
         S_PV_K: begin
-          if (pv_j_q == BC - 1) begin
+          if (pv_j_q == PV_STEPS - 1) begin
             pv_j_q  <= 0;
             ph_q    <= 0;
             state_q <= S_PV_CAP;
@@ -982,6 +989,13 @@ module flash_attn #(
               // On the final CAP cycle, comb is the complete PV partial.
               if (ph_q == FMA_LAT - 1) PV_part_reg[r][c] <= wide_to_fp16(comb);
             end
+          // Overlapped LUPD sample: by the first PV drain (dv_chunk 0), the
+          // lupd fmas have seen stable row_sum_r/alpha_r for ≥ PV_STEPS+FMA_LAT
+          // cycles, so lupd_y is fully settled. Sample l_r exactly once here
+          // (after which the always-on lupd driver re-accumulates a stale
+          // value, but it is never re-sampled this col-tile).
+          if (dv_chunk_q == 0 && ph_q == FMA_LAT - 1)
+            for (int r = 0; r < BR; r++) l_r[r] <= lupd_y[r];
           if (ph_q == FMA_LAT - 1) begin
             ph_q    <= 0;
             state_q <= S_MERGE_D;

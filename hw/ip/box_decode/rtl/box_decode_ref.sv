@@ -31,7 +31,8 @@ module box_decode_ref (
   output logic        [15:0] y2_o
 );
 
-  localparam int LATENCY = 19;
+  // Matches box_decode total latency: 1 (S0) + 6*FMA_LAT = 1 + 6*5 = 31.
+  localparam int LATENCY = 31;
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic       s;

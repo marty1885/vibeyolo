@@ -18,7 +18,7 @@ module softmax16_ref (
   output logic [15:0] y_o [16]
 );
 
-  localparam int LATENCY = 14;   // == DUT 11 register stages + FMA_LAT(3)
+  localparam int LATENCY = 16;   // == DUT 11 register stages + FMA_LAT(5)
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic        s;

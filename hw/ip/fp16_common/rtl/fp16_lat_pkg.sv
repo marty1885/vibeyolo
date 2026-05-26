@@ -16,9 +16,12 @@
 
 package fp16_lat_pkg;
 
-  // fp16_fma: stage1 unpack+multiply+align, stage2 add+normalize,
-  //           stage3 round+pack.
-  localparam int unsigned FP16_FMA_LAT = 3;
+  // fp16_fma (and the FMA_LAT-pinned fp16_macw): 5 pipeline stages —
+  //   s1 unpack+multiply+align, s2 add/sub, s3 leading-one detect,
+  //   s4 normalize barrel-shift, s5 round+pack.
+  // Deepened from 3 to 5 to break the add→LZD→normalize serial path that
+  // capped Fmax below 1 GHz on ASAP7 7nm (see reports/PDK_ASAP7.md).
+  localparam int unsigned FP16_FMA_LAT = 5;
 
   // i32_to_fp16: stage1 abs+leading-one+prescale+shift,
   //              stage2 align+round+pack.

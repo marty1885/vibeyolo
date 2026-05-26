@@ -99,13 +99,14 @@ module conv_layer
   localparam int CT_W          = $clog2((N_COUT_TILE < 2) ? 2 : N_COUT_TILE);
   localparam int DOT_LAT       = 1 + $clog2(N_LANE);
   // requant / add_rq latencies grew when i32_to_fp16 (1→2) and fp16_fma
-  // (1→3) were pipelined for timing. These mirror the submodule totals:
-  //   requant = I2F(2) + scale-bump(1) + FMA(3) + sat(1)            = 7
-  //   add_rq  = I2F(2) + FMA(3)×3      + sat(1)                     = 12
+  // (3→5, deepened for 7nm 1 GHz timing) were pipelined. These mirror the
+  // submodule totals:
+  //   requant = I2F(2) + scale-bump(1) + FMA(5) + sat(1)            = 9
+  //   add_rq  = I2F(2) + FMA(5)×3      + sat(1)                     = 18
   // (canonical leaf latencies live in fp16_lat_pkg; DV validates these).
-  localparam int REQUANT_LAT   = 7;
+  localparam int REQUANT_LAT   = 9;
   localparam int SILU_LAT      = 1;
-  localparam int ADDRQ_LAT     = 12;
+  localparam int ADDRQ_LAT     = 18;
 
   // Feed-forward; no internal stall.
   assign ready_o = 1'b1;

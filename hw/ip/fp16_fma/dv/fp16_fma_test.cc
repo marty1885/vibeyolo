@@ -197,7 +197,7 @@ static uint16_t fp16_fma_shadow(uint16_t a, uint16_t b, uint16_t c) {
 // and y_o reflects the triple just applied — letting every directed /
 // shadow check below read the result inline. Overlapped streaming (one
 // triple per tick) is exercised separately in test 5b.
-static constexpr int LAT = 3;
+static constexpr int LAT = 5;
 
 static void apply(SimCtrl<DUT>& s, uint16_t a, uint16_t b, uint16_t c) {
     s.dut->a_i = a;

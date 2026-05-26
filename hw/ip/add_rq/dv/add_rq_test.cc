@@ -10,9 +10,9 @@
 // rounding step uses an integer-mantissa RNE in __int128 (mirroring
 // the shadow style from hw/ip/fp16_fma/dv/fp16_fma_test.cc).
 //
-// The DUT pipeline has 12 cycles of latency (i32_to_fp16=2 + three
+// The DUT pipeline has 18 cycles of latency (i32_to_fp16=2 + three
 // fp16_fma=3 each + fp16_to_i8_sat=1); we apply stimulus, then sample
-// (y, valid) 12 cycles later.
+// (y, valid) 18 cycles later.
 
 #include <cstdint>
 #include <cstdio>
@@ -29,7 +29,7 @@
 
 using DUT = Vadd_rq_tb;
 
-static constexpr int LATENCY = 12;
+static constexpr int LATENCY = 18;
 
 // ─── fp16 ↔ double helpers (independent of SV REF) ──────────────
 struct F16 {

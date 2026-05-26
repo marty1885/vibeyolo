@@ -20,7 +20,7 @@
 
 using DUT = Vfp16_macw_tb;
 
-static constexpr int LAT      = 3;
+static constexpr int LAT      = 5;
 static constexpr int ACC_EXP  = 8;
 static constexpr int ACC_MANT = 21;
 static constexpr int ACC_BIAS = (1 << (ACC_EXP - 1)) - 1;   // 127

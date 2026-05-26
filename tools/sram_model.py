@@ -82,6 +82,33 @@ PDKS = {
                   liberty=os.environ.get("SKY130_HD_LIB",
                     "/home/marty/Documents/aif/pdk/sky130A/sky130A/libs.ref/"
                     "sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib")),
+    # REAL ASAP7 — ASU predictive 7nm PDK (asap7sc7p5t v28, RVT, TT corner),
+    # pulled from the OpenROAD-Project mirror. All structural numbers measured:
+    #   - liberty  : RVT_TT_merged.lib (SIMPLE+INVBUF+AO+OA+SEQ groups merged
+    #                by tools/merge_liberty.py; 202 cell types, time_unit 1ps).
+    #                chip_area.py re-synthesizes mac8 against it -> mac8_um2 cached.
+    #   - SCALE    : these libs/LEF are the "1x" (intended-7nm) views, NOT the
+    #                4x-drawn GDS. Verified: NAND2x1 liberty area 0.08748 µm² ==
+    #                LEF SIZE 0.324×0.27 (cell height 270nm = real 7.5T@7nm).
+    #                So areas are real µm² — do NOT divide by 16.
+    #   - um2_per_bit: asap7_sram_0p0 srambank_256x4x80_6t122 LEF 30.348×95.04
+    #                = 2884.3 µm² / (1024 words × 80b) = 0.0352 µm²/bit (densest
+    #                6T 1rw bank; small banks run ~0.061 from periphery).
+    #   - max_width/depth: that bank's word=80b, depth=1024 words.
+    #   - fmax     : SYNTH-derived bottleneck. tools/fmax_estimate.py: fp16_macw
+    #                worst reg-to-reg = 2406ps (416MHz); fp16_fma 1821ps (549MHz);
+    #                mac8 795ps. WireLoad="none" => optimistic upper bound; real
+    #                P&R is lower. clk_hz set to the measured bottleneck, NOT the
+    #                aspirational 1GHz (which this PDK shows is not met on RVT/TT).
+    #   - energy   : 7nm node-scaled (COARSE, ±2-3×; see power.py).
+    "asap7": PDK(name="asap7", um2_per_bit=0.0352, periph_um2=0.0,
+                 max_width=80, max_depth=1024, min_depth=64,
+                 fmax_hz=2.0e9, clk_hz=0.416e9, mac8_um2=0.0,
+                 rom_um2_per_bit=0.030, fmax_depth_model=False,
+                 liberty=os.environ.get("ASAP7_LIB",
+                   "/home/marty/Documents/aif/pdk/asap7/lib/"
+                   "asap7sc7p5t_RVT_TT_merged.lib"),
+                 e_mac_pj=0.05, e_mem_pj_bit=0.010, leak_mw_mm2=40.0),
 }
 
 # Active PDK (override with env PDK=sky130 or set_pdk()).

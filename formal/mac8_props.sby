@@ -1,0 +1,19 @@
+[options]
+mode prove
+depth 6
+
+[engines]
+smtbmc z3
+
+[script]
+read_verilog -sv -formal mac8.sv
+read_verilog -sv -formal mac8_props.sv
+chparam -set K @K@ mac8_props
+prep -top mac8_props
+# mac8 (and the shadow model) are async-reset; their init value is the reset
+# value 0, which prep drops. Pin it so the base case starts post-reset.
+setundef -zero -init
+
+[files]
+../hw/ip/mac8/rtl/mac8.sv
+mac8_props.sv

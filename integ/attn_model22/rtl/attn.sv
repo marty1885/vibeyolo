@@ -60,14 +60,14 @@ module attn #(
   localparam int N      = H * W;                 // 400
   localparam int CntW   = (N <= 1) ? 1 : $clog2(N) + 1;
   // Pipeline depths. The leaf IPs were pipelined for timing — keep these in
-  // sync with fp16_lat_pkg (i32_to_fp16=2, fp16_fma=3); the attn DV (which
+  // sync with fp16_lat_pkg (i32_to_fp16=2, fp16_fma=5); the attn DV (which
   // exercises the real leaf RTL end-to-end) fails if they drift.
   localparam int I2F_LAT = 2;                    // == fp16_lat_pkg::I32_TO_FP16_LAT
-  localparam int FMA_LAT = 3;                    // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int FMA_LAT = 5;                    // == fp16_lat_pkg::FP16_FMA_LAT
   // QKV deq chain: i32_to_fp16 → fp16_fma(×S_QKV)
-  localparam int QKV_LAT = I2F_LAT + FMA_LAT;          // 5
+  localparam int QKV_LAT = I2F_LAT + FMA_LAT;          // 7
   // ATTN_OUT chain: i2f → fma(×S_PE) → fma(O+pe) → fma(×INV_S_AOUT) → sat_i8
-  localparam int AO_LAT  = I2F_LAT + 3*FMA_LAT + 1;    // 12
+  localparam int AO_LAT  = I2F_LAT + 3*FMA_LAT + 1;    // 18
   localparam int DRIVE_TAIL_Q = QKV_LAT;
   localparam int DRIVE_TAIL_A = AO_LAT;
 
@@ -309,8 +309,8 @@ module attn #(
   //   r3    : sum   = fp16_fma(o_d2, 1.0, pe_fp)   (= O + pe)
   //   r4    : y_fp  = fp16_fma(sum, INV_S_AOUT, 0)
   //   r5    : i8    = fp16_to_i8_sat(y_fp)
-  // AO_LAT = I2F_LAT + 3*FMA_LAT + 1 = 12 from driven token to captured
-  // int8 (each fma is FMA_LAT=3 cycles, i2f is I2F_LAT=2, sat is 1).
+  // AO_LAT = I2F_LAT + 3*FMA_LAT + 1 = 18 from driven token to captured
+  // int8 (each fma is FMA_LAT=5 cycles, i2f is I2F_LAT=2, sat is 1).
   //
   // O channel layout: ATTN_OUT channel c == head (c/DIM_V), value-dim
   // (c%DIM_V). flash_attn packs O as o_flat[16*(h*N*DIM_V + n*DIM_V + d)].

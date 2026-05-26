@@ -97,9 +97,9 @@ int main(int argc, char** argv) {
         sim.tick();
     };
 
-    // Latency = I2F_LAT(2) + FMA_LAT(3) = 5 cycles; drain >= latency to
+    // Latency = I2F_LAT(2) + FMA_LAT(5) = 7 cycles; drain >= latency to
     // flush all in-flight vectors after the last drive.
-    const int LATENCY = 5;
+    const int LATENCY = 7;
     const int NIT = 20000;
     for (int i = 0; i < NIT + LATENCY + 2; i++) {
         on_edge();

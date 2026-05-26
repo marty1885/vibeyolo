@@ -45,6 +45,17 @@ assets/*.npy
 assets/calib/
 # Generated PDK reports (re-derivable from tools/chip_area.py, power.py, sram_bw.py)
 reports/
+# Physical design (P&R): generated netlists, layouts, LEF, logs (re-derivable
+# from the pnr/*.tcl + pnr/*.sh scripts and the block RTL; .def alone is 100s of MB)
+pnr/**/*.v
+pnr/**/*.netlist.v
+pnr/**/*.def
+pnr/**/*.lef
+pnr/**/*.log
+pnr/**/*.out
+# Formal SEC scratch tree (re-derivable from formal/Makefile)
+formal/work/
+
 # yosys/abc scratch + local scheduler state
 abc.history
 .claude/

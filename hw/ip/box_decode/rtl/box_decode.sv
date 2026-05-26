@@ -48,7 +48,7 @@
 //                          (extra delay 5*FMA_LAT − I2F_LAT)
 //     output ready at      5*FMA_LAT + FMA_LAT = 6*FMA_LAT
 //
-// Total latency = 1 (S0 reg) + 6*FMA_LAT = 19 cycles. Throughput = 1/cycle.
+// Total latency = 1 (S0 reg) + 6*FMA_LAT = 31 cycles. Throughput = 1/cycle.
 //
 // Bin constants 0..15 are baked as fp16 literals. The multiplier for i=0
 // is wasted (m[s][0]=0) but the tree structure is uniform; the optimizer
@@ -86,7 +86,7 @@ module box_decode (
   // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated;
   // do NOT import the package (this IP lives in ~many generated build lists).
   localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
-  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned FMA_LAT = 5;   // == fp16_lat_pkg::FP16_FMA_LAT
 
   // Arrival cycles (relative to S0 output) of the values that merge at the
   // final fmas, and the resulting bypass-delay depths.
@@ -103,7 +103,7 @@ module box_decode (
   // valid_i → valid_o total latency: 1 (S0 reg) + 6*FMA_LAT.
   localparam int unsigned TOTAL_LAT = 1 + 6*FMA_LAT;
 
-  // LATENCY = 19 cycles from valid_i high to valid_o high (documented above).
+  // LATENCY = 31 cycles from valid_i high to valid_o high (documented above).
 
   // Baked fp16 constants for i = 0..15.
   // 0 = 0x0000, 1 = 0x3C00, 2 = 0x4000, 3 = 0x4200, 4 = 0x4400,

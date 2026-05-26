@@ -1,0 +1,27 @@
+# Auto-generated from sec.sby.tmpl by formal/Makefile — do not edit the copy in work/.
+# Sequential equivalence check: synthesizable @IP@ vs re-coded golden @IP@_ref.
+# prove mode = BMC base case + unbounded temporal induction; word-level z3.
+[options]
+mode prove
+depth @DEPTH@
+
+[engines]
+smtbmc z3
+
+[script]
+read_verilog @IP@_d.v
+read_verilog @IP@_r.v
+hierarchy; proc
+miter -equiv -flatten -make_assert @IP@_ref @IP@ m
+hierarchy -top m
+async2sync
+opt -full
+# Reset modeling (per-IP, set by the Makefile): async-reset blocks lose their
+# init value here, leaving the base case to compare two arbitrary start states
+# -> pin init to the reset value (0). Blocks carrying their init through
+# async2sync must NOT do this (it would fabricate a wrong start state).
+@INITZERO@
+
+[files]
+@WORK@/@IP@_d.v
+@WORK@/@IP@_r.v

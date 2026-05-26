@@ -24,6 +24,18 @@
 //   5. Leading-one detect, normalise, extract mantissa+guard+round+sticky,
 //      RNE round, repack. Handle subnormal-output via additional right
 //      shift before extraction.
+//
+// LATENCY = 5 cycles (fp16_lat_pkg::FP16_FMA_LAT). Five register stages:
+//   s1 unpack+11x11 multiply+align(place_op);
+//   s2 add/sub of the aligned operands;
+//   s3 leading-one detect (LZD);
+//   s4 normalize barrel-shift + exponent/subnormal-shift calc;
+//   s5 subnormal right-shift + mantissa extract + RNE round + pack.
+// The cuts after the add (s2|s3) and between the LZD and the normalize shift
+// (s3|s4) break the serial add→LZD→shift chain that caps Fmax in 7nm; closes
+// 1 GHz on ASAP7 (RVT and SLVT). Keep this in lockstep with fp16_macw, which
+// is FMA_LAT-pinned to the same depth so flash_attn stays a drop-in swap.
+// Consumer DV fails if the package value and this depth ever drift.
 
 module fp16_fma (
   input  logic        clk_i,
@@ -188,13 +200,11 @@ module fp16_fma (
   assign wp = prod_zero     ? 100'd0 : wide_p;
   assign wc = c_is_zero_eff ? 100'd0 : wide_c;
 
-  // ─────────────────── stage-1 pipeline register ─────────────
+  // ═════════════════ stage-1 register (after align) ══════════
   // Cut after the 11×11 multiply and the 100-bit alignment barrel-shifts.
   // Carry forward the aligned operands, their signs, the anchor exponent,
   // and the special-case decisions (decoded combinationally from the
-  // inputs in stage 1) so stages 2/3 don't re-derive them.
-  // LATENCY = 3 cycles total (keep fp16_lat_pkg::FP16_FMA_LAT in sync;
-  // consumer DV will fail if they drift).
+  // inputs in stage 1) so later stages don't re-derive them.
   logic [99:0]        s1_wp, s1_wc;
   logic               s1_sp, s1_sc;
   logic signed [11:0] s1_e_low;
@@ -249,33 +259,93 @@ module fp16_fma (
     end
   end
 
-  // mag_raw bit i (for i in [0..99]) represents 2^((i-50) + e_low).
+  // ═════════════════ stage-2 register (after add) ════════════
+  // Cut between the wide add/sub and the leading-zero detect. Register the
+  // raw magnitude + result sign + anchor exponent + specials. This split
+  // (and the s3 cut below) breaks the add→LZD→normalize-shift serial chain
+  // that the 7nm timing shows is the Fmax wall.
+  logic [100:0]       s2_mag_raw;
+  logic               s2_result_sign;
+  logic signed [11:0] s2_e_low;
+  logic               s2_out_is_nan, s2_out_is_inf, s2_out_inf_sign;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      s2_mag_raw      <= 101'd0;
+      s2_result_sign  <= 1'b0;
+      s2_e_low        <= 12'sd0;
+      s2_out_is_nan   <= 1'b0;
+      s2_out_is_inf   <= 1'b0;
+      s2_out_inf_sign <= 1'b0;
+    end else begin
+      s2_mag_raw      <= mag_raw;
+      s2_result_sign  <= result_sign;
+      s2_e_low        <= s1_e_low;
+      s2_out_is_nan   <= s1_out_is_nan;
+      s2_out_is_inf   <= s1_out_is_inf;
+      s2_out_inf_sign <= s1_out_inf_sign;
+    end
+  end
+
+  // s2_mag_raw bit i (for i in [0..99]) represents 2^((i-50) + e_low).
   // Bit 100 is the same-sign carry → represents 2^(50 + e_low).
   //
-  // Find leading-1: lz = number of leading zeros in mag_raw (0..101).
+  // Find leading-1: lz = number of leading zeros in s2_mag_raw (0..101).
   logic [7:0] lz;
   logic       any_one;
   always_comb begin
     any_one = 1'b0;
     lz      = 8'd101;
     for (int i = 100; i >= 0; i--) begin
-      if (mag_raw[i] && !any_one) begin
+      if (s2_mag_raw[i] && !any_one) begin
         any_one = 1'b1;
         lz      = 8'(100 - i);
       end
     end
   end
 
+  // ═════════════════ stage-3 register (after LZD) ════════════
+  // Cut between the leading-zero detect and the normalize barrel-shift —
+  // the single cut that mattered most for 7nm Fmax (LZD result *is* the
+  // shift amount, so the two are otherwise a serial dependency).
+  logic [100:0]       s3_mag_raw;
+  logic [7:0]         s3_lz;
+  logic               s3_any_one, s3_result_sign;
+  logic signed [11:0] s3_e_low;
+  logic               s3_out_is_nan, s3_out_is_inf, s3_out_inf_sign;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      s3_mag_raw      <= 101'd0;
+      s3_lz           <= 8'd0;
+      s3_any_one      <= 1'b0;
+      s3_result_sign  <= 1'b0;
+      s3_e_low        <= 12'sd0;
+      s3_out_is_nan   <= 1'b0;
+      s3_out_is_inf   <= 1'b0;
+      s3_out_inf_sign <= 1'b0;
+    end else begin
+      s3_mag_raw      <= s2_mag_raw;
+      s3_lz           <= lz;
+      s3_any_one      <= any_one;
+      s3_result_sign  <= s2_result_sign;
+      s3_e_low        <= s2_e_low;
+      s3_out_is_nan   <= s2_out_is_nan;
+      s3_out_is_inf   <= s2_out_is_inf;
+      s3_out_inf_sign <= s2_out_inf_sign;
+    end
+  end
+
   // Exponent of the leading-1: bit (100-lz) → e = (100-lz - 50) + e_low
   //                                                = 50 - lz + e_low.
   logic signed [11:0] e_msb;
-  assign e_msb = 12'sd50 - $signed({4'b0, lz}) + s1_e_low;
+  assign e_msb = 12'sd50 - $signed({4'b0, s3_lz}) + s3_e_low;
 
-  // Normalise: shift mag_raw left by lz so leading-1 sits at bit 100.
+  // Normalise: shift s3_mag_raw left by lz so leading-1 sits at bit 100.
   logic [100:0] mag_norm_wide;
   always_comb begin
-    if (lz >= 8'd101) mag_norm_wide = 101'd0;
-    else              mag_norm_wide = mag_raw << lz[6:0];
+    if (s3_lz >= 8'd101) mag_norm_wide = 101'd0;
+    else                 mag_norm_wide = s3_mag_raw << s3_lz[6:0];
   end
 
   // We will extract 10 mantissa bits + guard + round + sticky from
@@ -312,39 +382,38 @@ module fp16_fma (
     else sub_shift = 8'(sub_shift_s);
   end
 
-  // ─────────────────── stage-2 pipeline register ─────────────
-  // Cut after the leading-zero detect + normalise barrel-shift. The
-  // subnormal right-shift, mantissa extraction, RNE round, and pack all
-  // run in stage 3 from these registers.
-  logic [100:0]       s2_mag_norm;
-  logic [7:0]         s2_sub_shift;
-  logic               s2_is_sub_path;
-  logic signed [11:0] s2_biased_exp_pre;
-  logic               s2_result_sign;
-  logic               s2_any_one;
-  logic               s2_out_is_nan, s2_out_is_inf, s2_out_inf_sign;
+  // ═════════════════ stage-4 register (after normalize) ══════
+  // Cut after the normalise barrel-shift. The subnormal right-shift,
+  // mantissa extraction, RNE round, and pack all run in stage 5.
+  logic [100:0]       s4_mag_norm;
+  logic [7:0]         s4_sub_shift;
+  logic               s4_is_sub_path;
+  logic signed [11:0] s4_biased_exp_pre;
+  logic               s4_result_sign;
+  logic               s4_any_one;
+  logic               s4_out_is_nan, s4_out_is_inf, s4_out_inf_sign;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      s2_mag_norm       <= 101'd0;
-      s2_sub_shift      <= 8'd0;
-      s2_is_sub_path    <= 1'b0;
-      s2_biased_exp_pre <= 12'sd0;
-      s2_result_sign    <= 1'b0;
-      s2_any_one        <= 1'b0;
-      s2_out_is_nan     <= 1'b0;
-      s2_out_is_inf     <= 1'b0;
-      s2_out_inf_sign   <= 1'b0;
+      s4_mag_norm       <= 101'd0;
+      s4_sub_shift      <= 8'd0;
+      s4_is_sub_path    <= 1'b0;
+      s4_biased_exp_pre <= 12'sd0;
+      s4_result_sign    <= 1'b0;
+      s4_any_one        <= 1'b0;
+      s4_out_is_nan     <= 1'b0;
+      s4_out_is_inf     <= 1'b0;
+      s4_out_inf_sign   <= 1'b0;
     end else begin
-      s2_mag_norm       <= mag_norm;
-      s2_sub_shift      <= sub_shift;
-      s2_is_sub_path    <= is_sub_path;
-      s2_biased_exp_pre <= biased_exp_pre;
-      s2_result_sign    <= result_sign;
-      s2_any_one        <= any_one;
-      s2_out_is_nan     <= s1_out_is_nan;
-      s2_out_is_inf     <= s1_out_is_inf;
-      s2_out_inf_sign   <= s1_out_inf_sign;
+      s4_mag_norm       <= mag_norm;
+      s4_sub_shift      <= sub_shift;
+      s4_is_sub_path    <= is_sub_path;
+      s4_biased_exp_pre <= biased_exp_pre;
+      s4_result_sign    <= s3_result_sign;
+      s4_any_one        <= s3_any_one;
+      s4_out_is_nan     <= s3_out_is_nan;
+      s4_out_is_inf     <= s3_out_is_inf;
+      s4_out_inf_sign   <= s3_out_inf_sign;
     end
   end
 
@@ -353,10 +422,10 @@ module fp16_fma (
   assign _unused_mag_post_top = mag_post[100];
   logic         sub_dropped;
   always_comb begin
-    mag_post    = s2_mag_norm >> s2_sub_shift[6:0];
+    mag_post    = s4_mag_norm >> s4_sub_shift[6:0];
     sub_dropped = 1'b0;
     for (int i = 0; i < 101; i++) begin
-      if ((8'(i) < s2_sub_shift) && s2_mag_norm[i]) sub_dropped = 1'b1;
+      if ((8'(i) < s4_sub_shift) && s4_mag_norm[i]) sub_dropped = 1'b1;
     end
   end
 
@@ -376,12 +445,12 @@ module fp16_fma (
 
   // ─────────────────────── pack ─────────────────────────────
   logic out_zero_exact;
-  assign out_zero_exact = !s2_any_one && !s2_out_is_nan && !s2_out_is_inf;
+  assign out_zero_exact = !s4_any_one && !s4_out_is_nan && !s4_out_is_inf;
 
   logic signed [11:0] biased_exp_pack;
   logic [9:0]         frac_final;
   always_comb begin
-    if (s2_is_sub_path) begin
+    if (s4_is_sub_path) begin
       // After the subnormal right-shift, the biased exp field is 0
       // unless mantissa rounding promotes to smallest normal.
       if (mant_rounded[10]) begin
@@ -393,10 +462,10 @@ module fp16_fma (
       end
     end else begin
       if (mant_rounded[10]) begin
-        biased_exp_pack = s2_biased_exp_pre + 12'sd1;
+        biased_exp_pack = s4_biased_exp_pre + 12'sd1;
         frac_final      = 10'd0;
       end else begin
-        biased_exp_pack = s2_biased_exp_pre;
+        biased_exp_pack = s4_biased_exp_pre;
         frac_final      = mant_rounded[9:0];
       end
     end
@@ -404,26 +473,26 @@ module fp16_fma (
 
   logic [15:0] y_d;
   always_comb begin
-    if (s2_out_is_nan) begin
+    if (s4_out_is_nan) begin
       y_d = 16'h7E00;
-    end else if (s2_out_is_inf) begin
-      y_d = {s2_out_inf_sign, 5'b11111, 10'b0};
+    end else if (s4_out_is_inf) begin
+      y_d = {s4_out_inf_sign, 5'b11111, 10'b0};
     end else if (out_zero_exact) begin
       // RNE: exact-zero result from cancellation is +0.
       y_d = 16'h0000;
     end else if (biased_exp_pack >= 12'sd31) begin
-      y_d = {s2_result_sign, 5'b11111, 10'b0};
+      y_d = {s4_result_sign, 5'b11111, 10'b0};
     end else if (biased_exp_pack <= 12'sd0) begin
       // Flush-to-zero on extreme underflow only if mant_rounded is also
       // zero (i.e., the subnormal-shift dropped everything). Otherwise
       // emit a proper subnormal: biased exp field 0, frac = mantissa.
       if (mant_rounded == 11'd0) begin
-        y_d = {s2_result_sign, 15'd0};
+        y_d = {s4_result_sign, 15'd0};
       end else begin
-        y_d = {s2_result_sign, 5'd0, frac_final};
+        y_d = {s4_result_sign, 5'd0, frac_final};
       end
     end else begin
-      y_d = {s2_result_sign, biased_exp_pack[4:0], frac_final};
+      y_d = {s4_result_sign, biased_exp_pack[4:0], frac_final};
     end
   end
 
@@ -431,7 +500,7 @@ module fp16_fma (
   logic _unused;
   assign _unused = ^{c_zero, ec_ext[11], ep_ext[11], 1'b0};
 
-  // ─────────────────────── register output ──────────────────
+  // ═════════════════ stage-5 register (output) ═══════════════
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) y_o <= 16'h0000;
     else         y_o <= y_d;

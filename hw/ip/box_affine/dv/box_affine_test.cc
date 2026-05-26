@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
 
     // The pipeline is feed-forward latency 18; we drive a stream and check
     // outputs as they emerge. Keep a small in-flight queue of expectations.
-    const int LATENCY = 18;
+    const int LATENCY = 28;
     struct Exp { int8_t l,t,r,b; uint16_t sbox; int col,row,stride; bool v; };
     std::vector<Exp> q;
 

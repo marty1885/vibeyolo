@@ -25,8 +25,8 @@
 //     significand+exponent so it does not depend on host floor/ceil.
 //
 //   * Output is registered to match the DUT's pipeline latency. TOTAL_LAT
-//     tracks the DUT: I2F_LAT(2) + FMA_LAT(3) + FMA_LAT(3) + FMA_LAT(3) +
-//     SAT_LAT(1) = 12 cycles.
+//     tracks the DUT: I2F_LAT(2) + FMA_LAT(5) + FMA_LAT(5) + FMA_LAT(5) +
+//     SAT_LAT(1) = 18 cycles.
 
 module add_rq_ref (
   input  logic               clk_i,
@@ -323,8 +323,8 @@ module add_rq_ref (
                           inv_out_scale_fp16_i, bias_fp16_i);
 
   // ── TOTAL_LAT-cycle pipeline to match DUT latency ───────────
-  // == add_rq's I2F_LAT + 3*FMA_LAT + SAT_LAT = 2 + 9 + 1 = 12.
-  localparam int unsigned TOTAL_LAT = 12;
+  // == add_rq's I2F_LAT + 3*FMA_LAT + SAT_LAT = 2 + 15 + 1 = 18.
+  localparam int unsigned TOTAL_LAT = 18;
   logic signed [7:0]    y_dl [TOTAL_LAT];
   logic [TOTAL_LAT-1:0] v_sr;
 

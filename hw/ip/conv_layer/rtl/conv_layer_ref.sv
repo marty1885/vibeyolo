@@ -68,9 +68,13 @@ module conv_layer_ref
   localparam int N_COUT_TILE = (COUT + P_COUT - 1) / P_COUT;
   localparam int CT_W        = $clog2((N_COUT_TILE < 2) ? 2 : N_COUT_TILE);
   localparam int DOT_LAT     = 1 + $clog2(N_LANE);
-  localparam int REQUANT_LAT = 4;
+  // Track the fp16_fma 3→5 deepening: requant gained +2 cycles (one extra
+  // FMA stage) and add_rq gained +6 (three FMAs × +2). These align the
+  // residual (R_DELAY) and cout_tile_idx (POST_LAT) around the real
+  // requant/add_rq instances; the bit-exact conv_layer DV validates them.
+  localparam int REQUANT_LAT = 6;
   localparam int SILU_LAT    = 1;
-  localparam int ADDRQ_LAT   = 5;
+  localparam int ADDRQ_LAT   = 11;
 
   assign ready_o = 1'b1;
   wire _u_ready = ready_i;

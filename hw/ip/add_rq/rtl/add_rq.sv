@@ -17,14 +17,14 @@
 //
 // Composition (leaf-IP latencies after pipelining for the clock target):
 //   stage 0: i32_to_fp16(a), i32_to_fp16(b)            (latency I2F_LAT=2)
-//   stage 1: fp16_fma(fp_a, scale_a, 0)  → ta          (latency FMA_LAT=3)
+//   stage 1: fp16_fma(fp_a, scale_a, 0)  → ta          (latency FMA_LAT=5)
 //            fp16_fma(fp_b, scale_b, 0)  → tb
-//   stage 2: fp16_fma(ta, 1.0, tb)       → sum         (latency FMA_LAT=3)
-//   stage 3: fp16_fma(sum, inv_out_scale, bias) → fp_y (latency FMA_LAT=3)
+//   stage 2: fp16_fma(ta, 1.0, tb)       → sum         (latency FMA_LAT=5)
+//   stage 3: fp16_fma(sum, inv_out_scale, bias) → fp_y (latency FMA_LAT=5)
 //   stage 4: fp16_to_i8_sat(fp_y)        → y_o         (latency SAT_LAT=1)
 //
 // Total latency from valid_i to (valid_o, y_o) is
-//   I2F_LAT + FMA_LAT + FMA_LAT + FMA_LAT + SAT_LAT = 2+3+3+3+1 = 12 cycles.
+//   I2F_LAT + FMA_LAT + FMA_LAT + FMA_LAT + SAT_LAT = 2+5+5+5+1 = 18 cycles.
 //
 // The i32_to_fp16 / fp16_fma latencies live in fp16_lat_pkg (the canonical
 // single source of truth). add_rq is instantiated in many generated layer
@@ -57,7 +57,7 @@ module add_rq (
 
   // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated.
   localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
-  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned FMA_LAT = 5;   // == fp16_lat_pkg::FP16_FMA_LAT
   localparam int unsigned SAT_LAT = 1;   // fp16_to_i8_sat (unchanged)
 
   // ─── stage 0: int8 → fp16 via i32_to_fp16 ─────────────────────

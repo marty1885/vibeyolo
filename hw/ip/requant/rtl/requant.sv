@@ -14,7 +14,7 @@
 //   4. fp16_to_i8_sat  : RNE + saturating clamp to [-128, +127].
 //
 // Pure feed-forward pipeline; total latency is
-//   I2F_LAT + 1 (scale-bump) + FMA_LAT + 1 (sat) = 2 + 1 + 3 + 1 = 7 cycles:
+//   I2F_LAT + 1 (scale-bump) + FMA_LAT + 1 (sat) = 2 + 1 + 5 + 1 = 9 cycles:
 //   stages 1..I2F_LAT  — i32_to_fp16 output (now 2-cycle pipelined)
 //   scale-bump register — scale-bump output (scale_fp16/bias aligned here)
 //   stages ..+FMA_LAT   — fp16_fma output (now 3-cycle pipelined)
@@ -46,7 +46,7 @@ module requant (
 
   // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated.
   localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
-  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned FMA_LAT = 5;   // == fp16_lat_pkg::FP16_FMA_LAT
   localparam int unsigned SAT_LAT = 1;   // fp16_to_i8_sat (unchanged)
   // valid_i → valid_o total latency.
   localparam int unsigned TOTAL_LAT = I2F_LAT + 1 + FMA_LAT + SAT_LAT;

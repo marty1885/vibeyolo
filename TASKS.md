@@ -284,3 +284,32 @@ drive it **layer by layer** against the real image's actual activations.
   the-loop spot-checked (convs 0–4 chained via real conv_stage == numpy).
   Side-by-side render → `integ/generated/e2e/chain_result.png` (ORT green /
   chip orange). **Conclusion: the chip works end-to-end on a real image.**
+
+## Physical P&R — known slow / problematic IPs
+
+Per-IP OpenROAD P&R (ASAP7 RVT, 1 GHz target) via `pnr/route_ips.sh` +
+`pnr/block_pnr.tcl`; full table in `pnr/IP_PNR_SUMMARY.md`. The following IPs need
+special handling — flagged here so the flow gates don't have to be rediscovered:
+
+- [x] **`box_decode` — too slow without fanout/hierarchy fixes (FIXED).** Largest
+  logic IP (24× `fp16_fma`, ~77,848 µm² routed / synth 75,724 µm²). First P&R
+  **hung >1 hr** in `global_route`: synth left `rst_ni` at **68,609 fanout** and
+  tie nets `zero_`/`one_` at 24,607 / 5,720, unbuffered → the router built giant
+  Steiner trees. Fixes (now in the flow): (1) `set_max_fanout 40` so
+  `repair_design` buffers reset/tie into trees; (2) `timeout 600` per IP so no
+  block can hang the session; (3) **hierarchical** synth (`synth -top X`, no
+  `-flatten`) so ABC maps `fp16_fma` once instead of 24× (minutes vs 17+ min).
+  → now routes in minutes at **0.91 GHz** (WNS −99 ps RVT).
+- [ ] **`softmax16` — not synthesizable through sv2v→yosys.** `real_to_fp16` uses
+  `real`/`longint` (sv2v: "inner type longint can't be indexed"). P&R skipped;
+  area/timing from behavioral model. Needs a synthesizable real→fp16 rewrite (or
+  treat as a hard macro) before it can route.
+- [ ] **`act_silu`, `act_sigmoid` — not synthesizable (`real` consts → yosys
+  `TOK_REAL`).** Both are LUT-baked int8→int8 in the real flow and **folded into
+  `conv_stage`**, so this does not block the chip; only standalone P&R is N/A.
+
+Big composite aggregators (`box_decode`, and to a lesser degree `box_affine`,
+`dequant_n`) are best reported by **synth area + leaf Fmax**, not a full route —
+routing a ~120k-cell block here is slow and no more informative than the critical
+leaf (`fp16_macw` 0.65, `fp16_fma` 0.74 GHz RVT). Whole-die top routing OOMs the
+box; route in partitions (see `tools/macro_floorplan.py --top-frac`).

@@ -22,7 +22,7 @@
 // are converted with i32_to_fp16; the head's FSM derives them from the
 // streaming anchor counter (no ROM).
 //
-// LATENCY = 18 cycles from valid_i to valid_o. Throughput 1 anchor/cycle.
+// LATENCY = 28 cycles from valid_i to valid_o. Throughput 1 anchor/cycle.
 //   1 (S0 input reg) + I2F_LAT (S1 i32→fp16) + 5*FMA_LAT (S2..S6 fma chain)
 //   = 1 + 2 + 5*3 = 18.
 // fp16 arithmetic ⇒ validated to a fp16-ULP tolerance (see DV), not bit-
@@ -65,9 +65,9 @@ module box_affine (
 
   // Leaf-IP latencies — mirror of fp16_lat_pkg (see header). DV-validated.
   localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
-  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned FMA_LAT = 5;   // == fp16_lat_pkg::FP16_FMA_LAT
   // valid_i → valid_o total latency: S0 + i2f + 5 fma stages.
-  localparam int unsigned TOTAL_LAT = 1 + I2F_LAT + 5*FMA_LAT;  // = 18
+  localparam int unsigned TOTAL_LAT = 1 + I2F_LAT + 5*FMA_LAT;  // = 28
 
   // ─────────────── valid pipeline (TOTAL_LAT stages) ───────────────
   logic [TOTAL_LAT-1:0] vq;

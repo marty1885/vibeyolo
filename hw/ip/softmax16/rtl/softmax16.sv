@@ -22,9 +22,9 @@
 //   S9  : sum tree level 3 (1)   → s
 //   S10 : inv_s = recip_lut(s)
 //   S11 : per-lane fp16_fma(e[i], inv_s, 0)  → y[i]
-//         (fp16_fma itself adds FMA_LAT=3 cycles)
+//         (fp16_fma itself adds FMA_LAT=5 cycles)
 //
-// Total latency = 11 (S0..S10 register stages) + FMA_LAT(3) = 14 cycles
+// Total latency = 11 (S0..S10 register stages) + FMA_LAT(5) = 16 cycles
 // from valid_i to valid_o.
 //
 // Note: e[i] is computed in S5 and must be carried alongside the sum
@@ -581,7 +581,7 @@ module softmax16 (
   // Leaf-IP latency — mirror of fp16_lat_pkg (do NOT import it here). The
   // output valid must be a FMA_LAT-deep shift register from v10 so valid_o
   // asserts exactly when y_o (the fp16_fma output) is valid.
-  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned FMA_LAT = 5;   // == fp16_lat_pkg::FP16_FMA_LAT
   logic [FMA_LAT-1:0] v11;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) v11 <= '0;

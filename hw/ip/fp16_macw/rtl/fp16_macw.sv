@@ -18,10 +18,16 @@
 // Inf. NaN propagates (canonical: exp all-ones, msb-frac set). a*b==-0 + +0
 // -> +0 (RNE).
 //
-// LATENCY = 3 cycles, identical to fp16_fma (fp16_lat_pkg::FP16_FMA_LAT).
+// LATENCY = 5 cycles, identical to fp16_fma (fp16_lat_pkg::FP16_FMA_LAT).
 // Pinning the latency means a consumer that interleaves partial sums for the
 // fp16_fma pipeline (e.g. flash_attn) keeps the *same* schedule when it swaps
 // in this wide-accumulate cell — only the datatype widens.
+//
+// Pipeline (5 stages): s1 unpack+product+align(place_op); s2 add/sub; s3
+// leading-one detect; s4 normalize barrel-shift; s5 subnormal-shift+round+pack.
+// The two extra cuts vs the original 3-stage (after the add, and between the
+// LZD and the normalize shift) break the serial leading-zero→shift chain that
+// caps Fmax in 7nm; closes 1 GHz on ASAP7 SLVT. See reports/PDK_ASAP7.md.
 //
 // Datapath (max-anchor, mirrors the proven fp16_fma DUT, generalized):
 //   1. Unpack a,b (fp16) and c (wide) to (sign, integer significand, eff_exp)
@@ -235,26 +241,65 @@ module fp16_macw #(
     end
   end
 
+  // ── CUT B (after add): register mag_raw before the LZD. LATENCY +1.
+  logic [WIN:0]   s1b_mag_raw;
+  logic           s1b_result_sign, s1b_sticky_pre;
+  int             s1b_anchor_top;
+  logic           s1b_out_is_nan, s1b_out_is_inf, s1b_out_inf_sign;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      s1b_mag_raw <= '0; s1b_result_sign <= 1'b0; s1b_sticky_pre <= 1'b0;
+      s1b_anchor_top <= 0;
+      s1b_out_is_nan <= 1'b0; s1b_out_is_inf <= 1'b0; s1b_out_inf_sign <= 1'b0;
+    end else begin
+      s1b_mag_raw <= mag_raw; s1b_result_sign <= result_sign;
+      s1b_sticky_pre <= s1_sticky_pre; s1b_anchor_top <= s1_anchor_top;
+      s1b_out_is_nan <= s1_out_is_nan; s1b_out_is_inf <= s1_out_is_inf;
+      s1b_out_inf_sign <= s1_out_inf_sign;
+    end
+  end
+
   // leading-one detect over the (WIN+1)-bit magnitude
   int  msb_pos; logic any_one;
   always_comb begin
     any_one = 1'b0; msb_pos = 0;
     for (int i = WIN; i >= 0; i--)
-      if (mag_raw[i] && !any_one) begin any_one = 1'b1; msb_pos = i; end
+      if (s1b_mag_raw[i] && !any_one) begin any_one = 1'b1; msb_pos = i; end
+  end
+
+  // ── CUT C (after LZD): register the leading-zero result + mag_raw, BEFORE
+  //    the normalize barrel-shift. This breaks the LZD->shift serial chain
+  //    that the 7nm timing shows is the wall. LATENCY +1.
+  logic [WIN:0]   s1c_mag_raw;
+  int             s1c_msb_pos, s1c_anchor_top;
+  logic           s1c_any_one, s1c_result_sign, s1c_sticky_pre;
+  logic           s1c_out_is_nan, s1c_out_is_inf, s1c_out_inf_sign;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      s1c_mag_raw <= '0; s1c_msb_pos <= 0; s1c_anchor_top <= 0;
+      s1c_any_one <= 1'b0; s1c_result_sign <= 1'b0; s1c_sticky_pre <= 1'b0;
+      s1c_out_is_nan <= 1'b0; s1c_out_is_inf <= 1'b0; s1c_out_inf_sign <= 1'b0;
+    end else begin
+      s1c_mag_raw <= s1b_mag_raw; s1c_msb_pos <= msb_pos;
+      s1c_anchor_top <= s1b_anchor_top; s1c_any_one <= any_one;
+      s1c_result_sign <= s1b_result_sign; s1c_sticky_pre <= s1b_sticky_pre;
+      s1c_out_is_nan <= s1b_out_is_nan; s1c_out_is_inf <= s1b_out_is_inf;
+      s1c_out_inf_sign <= s1b_out_inf_sign;
+    end
   end
 
   // exponent of the leading-1: bit b -> 2^(b - (WIN-2) + anchor_top)
   int e_msb;
-  assign e_msb = msb_pos - (WIN - 2) + s1_anchor_top;
+  assign e_msb = s1c_msb_pos - (WIN - 2) + s1c_anchor_top;
 
   // normalize: shift leading-1 up to bit WIN (top of an (WIN+1)-bit reg)
   int shl;
   logic [WIN:0] mag_norm;
   always_comb begin
-    shl = WIN - msb_pos;
-    if (!any_one)        mag_norm = '0;
-    else if (shl <= 0)   mag_norm = mag_raw;
-    else                 mag_norm = mag_raw << shl;
+    shl = WIN - s1c_msb_pos;
+    if (!s1c_any_one)    mag_norm = '0;
+    else if (shl <= 0)   mag_norm = s1c_mag_raw;
+    else                 mag_norm = s1c_mag_raw << shl;
   end
 
   // wide-normal extraction (leading-1 at bit WIN):
@@ -290,10 +335,10 @@ module fp16_macw #(
     end else begin
       s2_mag_norm <= mag_norm; s2_sub_shift <= sub_shift;
       s2_biased_exp_pre <= biased_exp_pre; s2_is_sub_path <= is_sub_path;
-      s2_result_sign <= result_sign; s2_any_one <= any_one;
-      s2_sticky_pre <= s1_sticky_pre;
-      s2_out_is_nan <= s1_out_is_nan; s2_out_is_inf <= s1_out_is_inf;
-      s2_out_inf_sign <= s1_out_inf_sign;
+      s2_result_sign <= s1c_result_sign; s2_any_one <= s1c_any_one;
+      s2_sticky_pre <= s1c_sticky_pre;
+      s2_out_is_nan <= s1c_out_is_nan; s2_out_is_inf <= s1c_out_is_inf;
+      s2_out_inf_sign <= s1c_out_inf_sign;
     end
   end
 

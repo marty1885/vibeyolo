@@ -659,7 +659,7 @@ static constexpr int OUT_W = {roi_out_w};
 static constexpr int DOT_LAT = {dot_lat};
 static constexpr int ACC_LAT = 1;
 static constexpr int RQ_IN_LAT = 1;
-static constexpr int REQUANT_LAT = 7;
+static constexpr int REQUANT_LAT = 9;
 static constexpr int SILU_LAT = 1;
 static constexpr int TOTAL_LAT = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT;
 
@@ -1335,9 +1335,9 @@ static constexpr int OUT_W = {roi_out_w};
 static constexpr int DOT_LAT = {dot_lat};
 static constexpr int ACC_LAT = 1;
 static constexpr int RQ_IN_LAT = 1;
-static constexpr int REQUANT_LAT = 7;
+static constexpr int REQUANT_LAT = 9;
 static constexpr int SILU_LAT = {silu_lat_val};
-static constexpr int ADDRQ_LAT = 12;
+static constexpr int ADDRQ_LAT = 18;
 static constexpr int TOTAL_LAT = DOT_LAT + ACC_LAT + RQ_IN_LAT + REQUANT_LAT + SILU_LAT + ADDRQ_LAT;
 
 static std::string stim_dir() {{ return std::string("../stim"); }}

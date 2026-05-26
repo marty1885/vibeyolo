@@ -9,7 +9,7 @@
 // The lesson from fp16_fma's test: fp16 FMA alignment can need ~76 bits;
 // fp32 is not enough. We use __int128 everywhere the magnitude lives.
 //
-// Pipeline latency: 7 cycles — i32_to_fp16(2) + scale-bump(1) + fp16_fma(3)
+// Pipeline latency: 9 cycles — i32_to_fp16(2) + scale-bump(1) + fp16_fma(5)
 // + fp16_to_i8_sat(1). We push a triple into the pipe, then sample valid_o
 // + y_o LATENCY cycles later (queue-aligned below).
 
@@ -26,7 +26,7 @@
 
 using DUT = Vrequant_tb;
 
-static constexpr int LATENCY = 7;
+static constexpr int LATENCY = 9;
 
 // ─── int32 → (fp16, shift) with auto-prescale ───────────────
 struct CvtOut { uint16_t fp16; uint8_t shift; };

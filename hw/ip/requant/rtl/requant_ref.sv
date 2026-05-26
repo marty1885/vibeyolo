@@ -10,7 +10,7 @@
 //
 // Pipeline: combinational compute (cvt → fma → sat), then a TOTAL_LAT-deep
 // output register chain so the latency matches the DUT exactly. TOTAL_LAT
-// tracks the DUT: I2F_LAT(2) + scale-bump(1) + FMA_LAT(3) + sat(1) = 7.
+// tracks the DUT: I2F_LAT(2) + scale-bump(1) + FMA_LAT(5) + sat(1) = 9.
 //
 // Algorithm:
 //   - cvt_i32_fp16 : sign + leading-1 scan + 10-bit mantissa with RNE.
@@ -390,7 +390,7 @@ module requant_ref (
   end
 
   // ───────────────────── TOTAL_LAT-cycle output align ──────
-  localparam int unsigned TOTAL_LAT = 7;   // == requant's I2F+1+FMA+sat
+  localparam int unsigned TOTAL_LAT = 9;   // == requant's I2F+1+FMA+sat
   logic signed [7:0]      r_dl [TOTAL_LAT];
   logic [TOTAL_LAT-1:0]   v_sr;
   always_ff @(posedge clk_i or negedge rst_ni) begin

@@ -31,8 +31,8 @@ module box_affine_ref (
 );
 
   // Matches box_affine total latency: 1 (S0) + I2F_LAT + 5*FMA_LAT
-  // = 1 + 2 + 5*3 = 18.
-  localparam int LATENCY = 18;
+  // = 1 + 2 + 5*5 = 28.
+  localparam int LATENCY = 28;
 
   function automatic real fp16_to_real(input logic [15:0] x);
     logic s; logic [4:0] eb; logic [9:0] f; real v, m; int e, k;

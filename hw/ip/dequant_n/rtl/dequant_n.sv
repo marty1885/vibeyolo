@@ -12,7 +12,7 @@
 // exact, the fused product equals fp16(exact_i8 × scale_fp16) — so the DV
 // golden matches BIT-EXACTLY (0 ULP), unlike the fp16-accumulating box path.
 //
-// LATENCY = I2F_LAT + FMA_LAT = 5 cycles (i32_to_fp16, then fma).
+// LATENCY = I2F_LAT + FMA_LAT = 7 cycles (i32_to_fp16, then fma).
 // Throughput 1 vector/cycle.
 
 module dequant_n #(
@@ -32,7 +32,7 @@ module dequant_n #(
   // Leaf-IP latencies — mirror of fp16_lat_pkg (do NOT import it here, this
   // block is instantiated in many generated build lists). DV-validated.
   localparam int unsigned I2F_LAT = 2;   // == fp16_lat_pkg::I32_TO_FP16_LAT
-  localparam int unsigned FMA_LAT = 3;   // == fp16_lat_pkg::FP16_FMA_LAT
+  localparam int unsigned FMA_LAT = 5;   // == fp16_lat_pkg::FP16_FMA_LAT
   // en_i → valid_o total latency.
   localparam int unsigned TOTAL_LAT = I2F_LAT + FMA_LAT;
 
